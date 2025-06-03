@@ -1,0 +1,34 @@
+use_multiprocessing: True  # Set to true only if serialization issues are resolved
+use_threading: True         # Recommended: good performance without serialization issues
+n_workers: 32               # Number of parallel workers (optional)
+
+num_data: 1
+ntrial: 1
+seed: 8312
+mag: 17.0                   # 17.0 is default
+hlr: 0.5                    # 0.5 is default
+psf_type: "moffat"          # "moffat" or "gauss"
+morph: 'exp'                
+pixel_scale: 0.2            # 0.2 is default
+layout_name: 'random'       # 'random' or 'grid'
+coadd_dim: 2550             # without rotation, image dim is coadd_dim + 1
+buff: 0                     # 0 is default
+sep: 9.5                    # null is default
+bands: ['i']                # ['i'] is default
+noise_factor: 0.58          # 0.58 is default
+dither: False               # False is default
+dither_size: 0.5            # 0.5 is default
+rotate: False               # False is default
+cosmic_rays: True          
+bad_columns: True       
+shear_setting: "vary"       # "vary" or "const"
+density: 80                 # per square arcmin, 80 is default  
+setting: "test_original"    
+
+# Star configuration
+star_catalog: null  
+star_bleeds: False 
+
+star_config: 
+    density: 10
+
