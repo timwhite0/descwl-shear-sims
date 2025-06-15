@@ -527,25 +527,29 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
 
     return images, plocs, g1_tensor, g2_tensor, n_sources_tensor, M
 
-def save_img_catalog(N, images, plocs, n_sources, M, g1, g2, setting=None):
+def save_img_catalog(N, images, plocs, n_sources, M, g1, g2, n_tiles_h, n_tiles_w, setting=None):
     """
     Save image AND catalog - optimized version
     """
     M = plocs.shape[1] 
-    
-    # More efficient tensor expansion
-    shear_1 = g1.unsqueeze(1).expand(-1, M, -1)
-    shear_2 = g2.unsqueeze(1).expand(-1, M, -1)
+
+    locs = plocs.unsqueeze(1).unsqueeze(2).expand(-1, n_tiles_h, n_tiles_w, -1, -1)
+
+    # Reshape g1 and g2 to (N, n_tiles_h, n_tiles_w, M, 1)
+    shear_1 = g1.view(N, 1, 1, 1, 1).expand(N, n_tiles_h, n_tiles_w, M, 1)
+    shear_2 = g2.view(N, 1, 1, 1, 1).expand(N, n_tiles_h, n_tiles_w, M, 1)
+
+    n_sources_reshaped = n_sources.view(N, 1, 1).expand(-1, n_tiles_h, n_tiles_w)
 
     catalog_dict = {
-        "plocs": plocs,
-        "n_sources": n_sources,
+        "locs": locs,
+        "n_sources": n_sources_reshaped,
         "shear_1": shear_1,
         "shear_2": shear_2,
     }
     
     save_folder = f"/data/scratch/taodingr/weak_lensing/descwl/{setting}"
-    os.makedirs(save_folder, exist_ok=True)  # More pythonic
+    os.makedirs(save_folder, exist_ok=True)  
 
     # Save with optimized settings
     torch.save(images, f"{save_folder}/images_{setting}.pt")
@@ -587,7 +591,7 @@ def main():
     print(f"Generated {images.shape[0]} images")
     print(f"Image dimension: {dim_w} x {dim_h}")
     print("Saving the images and catalogs ...")
-    save_img_catalog(images.shape[0], images, plocs, n_sources, M, g1, g2, setting=config['setting'])
+    save_img_catalog(images.shape[0], images, plocs, n_sources, M, g1, g2, config['n_tiles_per_side'], config['n_tiles_per_side'], setting=config['setting'])
 
 if __name__ == "__main__":
     main()
