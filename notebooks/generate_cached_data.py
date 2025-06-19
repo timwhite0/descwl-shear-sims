@@ -135,6 +135,8 @@ def Generate_single_img_catalog(
     )
     galaxy_catalog.angles = galaxy_catalog.rng.uniform(low=0, high=360, size=num)
 
+    magnitude = galaxy_catalog._wldeblend_cat[galaxy_catalog.indices]["i_ab"]
+
     if star_catalog is None:
         # only generate galaxies
         sim_data = make_sim(
@@ -201,7 +203,7 @@ def Generate_single_img_catalog(
     
     image_tensor = torch.stack(images, dim=0)
     
-    return image_tensor, positions_tensor, M
+    return image_tensor, positions_tensor, M, magnitude
 
 def pad_to_max_optimized(positions_list):
     """Optimized padding function using vectorized operations"""
@@ -233,7 +235,7 @@ def process_single_image(args):
     for _ in range(iter_idx):
         rng.rand()
     
-    each_image, positions_tensor, M = Generate_single_img_catalog(
+    each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
         1, rng, config['mag'], config['hlr'], psf, config['morph'], 
         config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
         config['sep'], g1_val, g2_val, config['bands'], config['noise_factor'], 
@@ -253,7 +255,7 @@ def process_single_image(args):
     # Use slice operations for efficiency
     single_image = each_image[:, start_h:start_h + crop_size, start_w:start_w + crop_size]
     
-    return single_image, positions_tensor, M
+    return single_image, positions_tensor, M, magnitude
 
 def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False, n_workers=None):
     """
@@ -311,7 +313,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
     
     # Generate first image to estimate storage requirements
     print("Generating first image to estimate storage requirements...")
-    first_image, first_positions, first_M = Generate_single_img_catalog(
+    first_image, first_positions, first_M, first_magnitude = Generate_single_img_catalog(
         1, rng, config['mag'], config['hlr'], psf, config['morph'], 
         config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
         config['sep'], g1[0], g2[0], config['bands'], config['noise_factor'], 
@@ -320,7 +322,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
         star_catalog, shifts, config['catalog_type'], config['select_observable'], 
         config['select_lower_limit'], config['select_upper_limit']
     )
-    
+
     # Crop first image
     H, W = first_image.shape[1], first_image.shape[2]
     crop_size = 2048
@@ -365,6 +367,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
     images_list = [first_image_cropped]
     positions = [first_positions]
     n_sources = [first_M]
+    magnitudes = [first_magnitude]
     
     # Continue generating remaining images
     remaining_images = num_data - 1
@@ -394,13 +397,14 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
                     ))
                 
                 # Unpack multiprocessing results
-                for single_image, positions_tensor, M in results:
+                for single_image, positions_tensor, M, magnitude in results:
                     if single_image.shape[1] != 2048:
                         print("The output dimension is not 2048, check coadd_dim and rotate")
                         break
                     images_list.append(single_image)
                     positions.append(positions_tensor)
                     n_sources.append(M)
+                    magnitudes.append(magnitude)
                     
             except Exception as e:
                 print(f"Multiprocessing failed: {e}")
@@ -447,7 +451,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
                         star_config=config['star_config']
                     )
                 
-                each_image, positions_tensor, M = Generate_single_img_catalog(
+                each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
                     1, thread_rng, config['mag'], config['hlr'], thread_psf, config['morph'], 
                     config['pixel_scale'], thread_layout, config['coadd_dim'], config['buff'], 
                     config['sep'], g1[iter_idx], g2[iter_idx], config['bands'], 
@@ -525,7 +529,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
     n_sources_tensor = torch.tensor(n_sources, dtype=torch.long)
     M = max(n_sources) if n_sources else 0
 
-    return images, plocs, g1_tensor, g2_tensor, n_sources_tensor, M
+    return images, plocs, g1_tensor, g2_tensor, n_sources_tensor, M, magnitudes
 
 def save_img_catalog(N, images, plocs, n_sources, M, g1, g2, n_tiles_h, n_tiles_w, setting=None):
     """
@@ -558,6 +562,19 @@ def save_img_catalog(N, images, plocs, n_sources, M, g1, g2, n_tiles_h, n_tiles_
     print(f"Image saved to: {save_folder}/images_{setting}.pt")
     print(f"Catalog saved to: {save_folder}/catalog_{setting}.pt")
 
+def plot_magnitude_distribution(magnitudes, num_selected, config):
+    if num_selected > config['num_data']:
+        print(f"selected number of galaxies is greater than generated number of galaxies, setting num_selected to {config['num_data']}")
+        num_selected = config['num_data']
+
+    mag = magnitudes[:num_selected]
+    mag_combined = np.concatenate(mag)
+    plt.hist(mag_combined, bins=100)
+    plt.xlabel("i-band ab magnitude")
+    plt.ylabel("Count")
+    plt.savefig(f"/data/scratch/taodingr/lsst_stack/descwl-shear-sims/notebooks/magnitude_distribution.png")
+
+
 def main():
     with open('sim_config.yaml', 'r') as f:
         config = yaml.safe_load(f)
@@ -585,7 +602,8 @@ def main():
         print("Image generation stopped due to insufficient disk space.")
         return
     
-    images, plocs, g1, g2, n_sources, M = result
+    images, plocs, g1, g2, n_sources, M, magnitudes = result
+    plot_magnitude_distribution(magnitudes, 50, config)
 
     dim_w, dim_h = images.shape[2], images.shape[3]
     print(f"Generated {images.shape[0]} images")
