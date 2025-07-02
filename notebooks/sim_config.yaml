@@ -1,6 +1,7 @@
-use_multiprocessing: True  # Set to true only if serialization issues are resolved
-use_threading: True         # Recommended: good performance without serialization issues
-n_workers: 32               # Number of parallel workers (optional)
+use_multiprocessing: true  # Set to true only if serialization issues are resolved
+use_threading: false         # Recommended: good performance without serialization issues
+n_workers: 8        # Number of parallel workers (optional)
+
 
 num_data: 2000
 ntrial: 1
@@ -23,7 +24,7 @@ cosmic_rays: True
 bad_columns: True       
 shear_setting: "vary"       # "vary" or "const"
 density: 80                 # per square arcmin, 80 is default  
-setting: WLD_density_80_1x1    
+setting: WLD_80_star_max_100_with_bleeds_with_filter
 catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'
 select_observable: 'i_ab'   # column name in the WLDEBlend catalog
 select_lower_limit: null
@@ -31,9 +32,12 @@ select_upper_limit: 27
 n_tiles_per_side: 1
 
 # Star configuration
-star_catalog: null  
-star_bleeds: False 
+star_catalog: true # set to null to disable star catalog
+star_bleeds: true 
 
 star_config: 
-    density: 10
+    max_density: 100 # density, max_density or min_density
 
+star_filter_mag: 18
+star_filter: true
+star_filter_band: 'r'

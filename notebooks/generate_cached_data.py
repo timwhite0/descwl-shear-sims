@@ -14,17 +14,125 @@ from tqdm import tqdm
 from descwl_shear_sims.layout.layout import Layout
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
+import time
+from datetime import datetime
+from quick_speedup_patch import apply_speedup_patch
+
 
 os.environ['CATSIM_DIR'] = '/data/scratch/taodingr/lsst_stack/catsim' 
 
 import shutil
 
-total, used, free = shutil.disk_usage("/data/scratch/taodingr/weak_lensing/descwl")
-print(f"Disk space for /data/scratch/taodingr/weak_lensing/descwl:")
+save_folder = f"/nfs/turbo/lsa-regier/scratch/taodingr/descwl"
+total, used, free = shutil.disk_usage(save_folder)
+print(f"Disk space for {save_folder}:")
 print(f"  Total: {total // (2**30)} GiB")
 print(f"  Used:  {used // (2**30)} GiB")
 print(f"  Free:  {free // (2**30)} GiB")
 space_available = free // (2**30)
+
+def filter_bright_stars_production(star_catalog, mag_threshold=18, band='r', verbose=True):
+    """
+    Production-ready bright star filter for massive performance gains
+    
+    Based on test results:
+    - mag_threshold=18: 91.6% faster (removes stars that go through draw_bright_star)
+    - mag_threshold=15: 29.4% faster (removes only very bright stars)
+    
+    Parameters:
+    -----------
+    star_catalog : StarCatalog
+        Original star catalog from make_star_catalog()
+    mag_threshold : float
+        Magnitude threshold - stars brighter (lower mag) than this will be removed
+        Recommended values:
+        - 18.0: Maximum speedup (91.6% faster)
+        - 15.0: Conservative speedup (29.4% faster) 
+        - 16.0: Moderate speedup (49.9% faster)
+    band : str
+        Band to use for magnitude filtering (default: 'r')
+    verbose : bool
+        Print filtering statistics
+    """
+    if star_catalog is None:
+        return None
+    
+    n_original = len(star_catalog)
+    
+    if verbose:
+        print(f"\n=== BRIGHT STAR FILTERING (PRODUCTION) ===")
+        print(f"Removing stars with mag < {mag_threshold} in {band}-band")
+        print(f"Original stars: {n_original}")
+    
+    # Get star data and current indices
+    star_data = star_catalog._star_cat
+    current_indices = star_catalog.indices
+    
+    # Get magnitudes for the current stars
+    mag_column = f'{band}_ab'
+    if mag_column not in star_data.dtype.names:
+        available_bands = [col.replace('_ab', '') for col in star_data.dtype.names if '_ab' in col]
+        if available_bands:
+            band = available_bands[0]
+            mag_column = f'{band}_ab'
+            if verbose:
+                print(f"Using {band}-band instead of {band}")
+        else:
+            print(f"ERROR: No magnitude columns found!")
+            return star_catalog
+    
+    magnitudes = star_data[mag_column][current_indices]
+    
+    # Create mask to keep only non-bright stars (mag >= threshold)
+    # Lower magnitude = brighter star, so we keep stars with mag >= threshold
+    keep_mask = np.isfinite(magnitudes) & (magnitudes >= mag_threshold)
+    n_kept = np.sum(keep_mask)
+    n_removed = n_original - n_kept
+    
+    if verbose:
+        print(f"Stars kept (mag >= {mag_threshold}): {n_kept} ({100*n_kept/n_original:.1f}%)")
+        print(f"Bright stars removed (mag < {mag_threshold}): {n_removed} ({100*n_removed/n_original:.1f}%)")
+        
+        # Show expected speedup based on test results
+        '''
+        expected_speedups = {
+            15.0: "~30% faster",
+            16.0: "~50% faster", 
+            18.0: "~92% faster"
+        }
+        expected = expected_speedups.get(mag_threshold, "speedup varies")
+        print(f"Expected performance improvement: {expected}")
+        '''
+    
+    if n_kept == 0:
+        print("WARNING: All stars would be removed! Using original catalog.")
+        return star_catalog
+    
+    if n_removed == 0:
+        print("INFO: No bright stars found to remove.")
+        return star_catalog
+    
+    # Create filtered catalog
+    filtered_catalog = StarCatalog(
+        rng=star_catalog.rng,
+        layout='random',  # Will be overridden
+        coadd_dim=600,    # Will be overridden  
+        buff=0,           # Will be overridden
+        pixel_scale=0.2,  # Will be overridden
+        density=n_kept,   # Approximate density
+    )
+    
+    # Copy filtered data
+    filtered_catalog._star_cat = star_catalog._star_cat
+    filtered_catalog.shifts_array = star_catalog.shifts_array[keep_mask]
+    filtered_catalog.indices = star_catalog.indices[keep_mask]
+    filtered_catalog.density = star_catalog.density * (n_kept / n_original)
+    
+    if verbose:
+        print(f"✅ Filtered catalog created: {len(filtered_catalog)} stars")
+        print(f"🚀 Expected to prevent {n_removed} expensive draw_bright_star() calls")
+    
+    return filtered_catalog
 
 def estimate_tensor_size_mb(tensor):
     """
@@ -101,7 +209,7 @@ def Generate_single_img_catalog(
     # Remove unnecessary loop - ntrial should always be 1 for single image generation
     if ntrial != 1:
         print("Warning: ntrial should be 1 for single image generation")
-    
+
     if catalog_type == 'wldeblend':
         galaxy_catalog = WLDeblendGalaxyCatalog(
         rng=rng,
@@ -113,6 +221,16 @@ def Generate_single_img_catalog(
         select_lower_limit=select_lower_limit,
         select_upper_limit=select_upper_limit
         )
+        
+        galaxy_catalog.shifts_array = shifts
+        num = len(galaxy_catalog.shifts_array)
+        galaxy_catalog.indices = galaxy_catalog.rng.randint(
+            0,
+            galaxy_catalog._wldeblend_cat.size,
+            size=num,
+        )
+        galaxy_catalog.angles = galaxy_catalog.rng.uniform(low=0, high=360, size=num)
+        magnitude = galaxy_catalog._wldeblend_cat[galaxy_catalog.indices]["i_ab"]
     else:
         galaxy_catalog = FixedGalaxyCatalog(
         rng=rng,
@@ -126,16 +244,8 @@ def Generate_single_img_catalog(
         sep=sep
         )
 
-    galaxy_catalog.shifts_array = shifts
-    num = len(galaxy_catalog.shifts_array)
-    galaxy_catalog.indices = galaxy_catalog.rng.randint(
-        0,
-        galaxy_catalog._wldeblend_cat.size,
-        size=num,
-    )
-    galaxy_catalog.angles = galaxy_catalog.rng.uniform(low=0, high=360, size=num)
-
-    magnitude = galaxy_catalog._wldeblend_cat[galaxy_catalog.indices]["i_ab"]
+        galaxy_catalog.shifts_array = shifts
+        magnitude = []
 
     if star_catalog is None:
         # only generate galaxies
@@ -193,15 +303,16 @@ def Generate_single_img_catalog(
     M = len(image_x_positions)
 
     # Pre-allocate list for better performance
-    images = []
+    n_bands = len(bands)
+    first_band = bands[0]
+    h, w = sim_data['band_data'][first_band][0].image.array.shape
     
-    for band in bands:
+    # Pre-allocate tensor
+    image_tensor = torch.zeros(n_bands, h, w, dtype=torch.float32)
+    
+    for i, band in enumerate(bands):
         image_np = sim_data['band_data'][band][0].image.array
-        # Ensure contiguous memory layout for multiprocessing compatibility
-        image_copy = np.array(image_np, copy=True)
-        images.append(torch.from_numpy(image_copy).float())
-    
-    image_tensor = torch.stack(images, dim=0)
+        image_tensor[i] = torch.from_numpy(image_np.copy())
     
     return image_tensor, positions_tensor, M, magnitude
 
@@ -245,15 +356,13 @@ def process_single_image(args):
         config['select_lower_limit'], config['select_upper_limit']
     )
     
-    # Optimized cropping
-    H, W = each_image.shape[1], each_image.shape[2]
     crop_size = 2048
+    h_center, w_center = each_image.shape[1] // 2, each_image.shape[2] // 2
+    half_crop = crop_size // 2
     
-    start_h = (H - crop_size) // 2
-    start_w = (W - crop_size) // 2
-    
-    # Use slice operations for efficiency
-    single_image = each_image[:, start_h:start_h + crop_size, start_w:start_w + crop_size]
+    single_image = each_image[:, 
+                             h_center - half_crop:h_center + half_crop,
+                             w_center - half_crop:w_center + half_crop]
     
     return single_image, positions_tensor, M, magnitude
 
@@ -292,6 +401,19 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
             star_config=config['star_config']
         )
         print("Generating Galaxies and Stars")
+        if config['star_filter']:
+            star_catalog_filtered = filter_bright_stars_production(
+                star_catalog, 
+                mag_threshold=config['star_filter_mag'], 
+                band=config['star_filter_band'], 
+                verbose=True)
+            if star_catalog_filtered is not None:
+                print(f"✅ Generating Galaxies with filtered Star Catalog (mag >= {config['star_filter_mag']})")
+            else:
+                print("⚠️  All bright stars filtered. Generating only Galaxies.")
+        else:
+            print("✅ Generating Galaxies with original Star Catalog")
+            star_catalog_filtered = star_catalog
     else:
         print("Only generating Galaxies")
     
@@ -310,7 +432,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
     )
     
     shifts = layout.get_shifts(rng, density=config['density'])
-    
+
     # Generate first image to estimate storage requirements
     print("Generating first image to estimate storage requirements...")
     first_image, first_positions, first_M, first_magnitude = Generate_single_img_catalog(
@@ -319,10 +441,10 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
         config['sep'], g1[0], g2[0], config['bands'], config['noise_factor'], 
         config['dither'], config['dither_size'], config['rotate'], 
         config['cosmic_rays'], config['bad_columns'], config['star_bleeds'], 
-        star_catalog, shifts, config['catalog_type'], config['select_observable'], 
+        star_catalog_filtered, shifts, config['catalog_type'], config['select_observable'], 
         config['select_lower_limit'], config['select_upper_limit']
     )
-
+   
     # Crop first image
     H, W = first_image.shape[1], first_image.shape[2]
     crop_size = 2048
@@ -349,7 +471,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
     }
     
     # Check storage requirements
-    save_folder = f"/data/scratch/taodingr/weak_lensing/descwl/{config['setting']}"
+    save_folder = f"/nfs/turbo/lsa-regier/scratch/taodingr/descwl/{config['setting']}"
     os.makedirs(save_folder, exist_ok=True)
     
     if not check_storage_requirements(first_image_cropped.unsqueeze(0), first_catalog_dict, num_data, save_folder):
@@ -424,32 +546,14 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
                 thread_rng = np.random.RandomState(config['seed'] + iter_idx * 1000)
                 
                 # Create thread-local copies of shared objects to avoid conflicts
-                thread_layout = Layout(
-                    layout_name=config['layout_name'],
-                    coadd_dim=config['coadd_dim'],
-                    pixel_scale=config['pixel_scale'],
-                    buff=config['buff']
-                )
-                
-                # Create thread-local PSF
-                if config['psf_type'] == "gauss":
-                    thread_psf = make_fixed_psf(psf_type=config['psf_type']) 
-                elif config['psf_type'] == "moffat":  
-                    thread_psf = make_fixed_psf(psf_type=config['psf_type'], psf_fwhm=0.8)
+                thread_layout = layout
+                thread_psf = psf
                 
                 # Get shifts for this thread
-                thread_shifts = thread_layout.get_shifts(thread_rng, density=config['density'])
+                thread_shifts = shifts if shifts is not None else layout.get_shifts(thread_rng, density=config['density'])
                 
-                # Create thread-local star catalog if needed
-                thread_star_catalog = None
-                if config['star_catalog'] is not None:
-                    thread_star_catalog = make_star_catalog(
-                        rng=thread_rng,
-                        coadd_dim=config['coadd_dim'],
-                        buff=config['buff'],
-                        pixel_scale=config['pixel_scale'],
-                        star_config=config['star_config']
-                    )
+                # Reuse the shared star catalog (thread-safe for read operations)
+                thread_star_catalog = star_catalog
                 
                 each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
                     1, thread_rng, config['mag'], config['hlr'], thread_psf, config['morph'], 
@@ -494,13 +598,15 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
         elif not use_multiprocessing and not use_threading and remaining_images > 0:
             # Sequential processing for remaining images
             for iter_idx in tqdm(range(1, num_data), desc="Generating remaining images (sequential)"):
-                each_image, positions_tensor, M = Generate_single_img_catalog(
+                each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
                     1, rng, config['mag'], config['hlr'], psf, config['morph'], 
                     config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
                     config['sep'], g1[iter_idx], g2[iter_idx], config['bands'], 
                     config['noise_factor'], config['dither'], config['dither_size'], 
                     config['rotate'], config['cosmic_rays'], config['bad_columns'], 
-                    config['star_bleeds'], star_catalog, shifts
+                    config['star_bleeds'], star_catalog, shifts, 
+                    config['catalog_type'], config['select_observable'], 
+                    config['select_lower_limit'], config['select_upper_limit']
                 )
                 
                 # Optimized cropping
@@ -536,14 +642,16 @@ def save_img_catalog(N, images, plocs, n_sources, M, g1, g2, n_tiles_h, n_tiles_
     Save image AND catalog - optimized version
     """
     M = plocs.shape[1] 
-
-    locs = plocs.unsqueeze(1).unsqueeze(2).expand(-1, n_tiles_h, n_tiles_w, -1, -1)
-
-    # Reshape g1 and g2 to (N, n_tiles_h, n_tiles_w, M, 1)
-    shear_1 = g1.view(N, 1, 1, 1, 1).expand(N, n_tiles_h, n_tiles_w, M, 1)
-    shear_2 = g2.view(N, 1, 1, 1, 1).expand(N, n_tiles_h, n_tiles_w, M, 1)
-
-    n_sources_reshaped = n_sources.view(N, 1, 1).expand(-1, n_tiles_h, n_tiles_w)
+    
+    # Pre-allocate tensors
+    locs_shape = (N, n_tiles_h, n_tiles_w, M, 2)
+    shear_shape = (N, n_tiles_h, n_tiles_w, M, 1)
+    n_sources_shape = (N, n_tiles_h, n_tiles_w)
+    
+    locs = plocs.view(N, 1, 1, M, 2).expand(locs_shape)
+    shear_1 = g1.view(N, 1, 1, 1, 1).expand(shear_shape)
+    shear_2 = g2.view(N, 1, 1, 1, 1).expand(shear_shape)
+    n_sources_reshaped = n_sources.view(N, 1, 1).expand(n_sources_shape)
 
     catalog_dict = {
         "locs": locs,
@@ -552,12 +660,14 @@ def save_img_catalog(N, images, plocs, n_sources, M, g1, g2, n_tiles_h, n_tiles_
         "shear_2": shear_2,
     }
     
-    save_folder = f"/data/scratch/taodingr/weak_lensing/descwl/{setting}"
+    save_folder = f"/nfs/turbo/lsa-regier/scratch/taodingr/descwl/{setting}"
     os.makedirs(save_folder, exist_ok=True)  
 
     # Save with optimized settings
-    torch.save(images, f"{save_folder}/images_{setting}.pt")
-    torch.save(catalog_dict, f"{save_folder}/catalog_{setting}.pt")
+    torch.save(images, f"{save_folder}/images_{setting}.pt", 
+               _use_new_zipfile_serialization=True)  # Faster serialization
+    torch.save(catalog_dict, f"{save_folder}/catalog_{setting}.pt",
+               _use_new_zipfile_serialization=True)
 
     print(f"Image saved to: {save_folder}/images_{setting}.pt")
     print(f"Catalog saved to: {save_folder}/catalog_{setting}.pt")
@@ -576,6 +686,12 @@ def plot_magnitude_distribution(magnitudes, num_selected, config):
 
 
 def main():
+    start_time = time.time()
+    start_datetime = datetime.now()
+    
+    print(f"=== SIMULATION STARTED ===")
+    print(f"Start time: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"=" * 50)
     with open('sim_config.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
@@ -592,6 +708,7 @@ def main():
     
     print(f"Processing mode: {processing_mode}")
     
+    # apply_speedup_patch()
     result = Generate_img_catalog(
         config, use_multiprocessing=use_multiprocessing, 
         use_threading=use_threading, n_workers=n_workers
@@ -603,13 +720,21 @@ def main():
         return
     
     images, plocs, g1, g2, n_sources, M, magnitudes = result
-    plot_magnitude_distribution(magnitudes, 50, config)
+    if config['catalog_type'] == 'wldeblend':
+        plot_magnitude_distribution(magnitudes, 50, config)
 
     dim_w, dim_h = images.shape[2], images.shape[3]
     print(f"Generated {images.shape[0]} images")
     print(f"Image dimension: {dim_w} x {dim_h}")
     print("Saving the images and catalogs ...")
     save_img_catalog(images.shape[0], images, plocs, n_sources, M, g1, g2, config['n_tiles_per_side'], config['n_tiles_per_side'], setting=config['setting'])
+
+    end_time = time.time()
+    end_datetime = datetime.now()
+    print(f"=== SIMULATION COMPLETED ===")
+    print(f"End time: {end_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Total runtime: {end_time - start_time:.2f} seconds")
+    print(f"=" * 50)
 
 if __name__ == "__main__":
     main()
