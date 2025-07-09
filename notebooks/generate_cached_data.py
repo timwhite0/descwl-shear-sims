@@ -16,8 +16,6 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import multiprocessing as mp
 import time
 from datetime import datetime
-from quick_speedup_patch import apply_speedup_patch
-
 
 os.environ['CATSIM_DIR'] = '/data/scratch/taodingr/lsst_stack/catsim' 
 
@@ -402,18 +400,17 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
         )
         print("Generating Galaxies and Stars")
         if config['star_filter']:
-            star_catalog_filtered = filter_bright_stars_production(
+            star_catalog = filter_bright_stars_production(
                 star_catalog, 
                 mag_threshold=config['star_filter_mag'], 
                 band=config['star_filter_band'], 
                 verbose=True)
-            if star_catalog_filtered is not None:
+            if star_catalog is not None:
                 print(f"✅ Generating Galaxies with filtered Star Catalog (mag >= {config['star_filter_mag']})")
             else:
                 print("⚠️  All bright stars filtered. Generating only Galaxies.")
         else:
             print("✅ Generating Galaxies with original Star Catalog")
-            star_catalog_filtered = star_catalog
     else:
         print("Only generating Galaxies")
     
@@ -441,7 +438,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
         config['sep'], g1[0], g2[0], config['bands'], config['noise_factor'], 
         config['dither'], config['dither_size'], config['rotate'], 
         config['cosmic_rays'], config['bad_columns'], config['star_bleeds'], 
-        star_catalog_filtered, shifts, config['catalog_type'], config['select_observable'], 
+        star_catalog, shifts, config['catalog_type'], config['select_observable'], 
         config['select_lower_limit'], config['select_upper_limit']
     )
    
