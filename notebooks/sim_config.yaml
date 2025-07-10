@@ -8,7 +8,7 @@ resume_mode: true          # Set to true to automatically resume from existing f
 start_from: 0             # Only used if resume_mode is false - start from this index
 
 
-num_data: 1            # number of images to generate
+num_data: 2000            # number of images to generate
 ntrial: 1
 seed: 8312
 mag: 17.0                   # 17.0 is default
@@ -21,7 +21,7 @@ coadd_dim: 2550             # without rotation, image dim is coadd_dim + 1
 buff: 0                     # 0 is default
 sep: 9.5                   # null is default
 bands: ['r', 'i', 'z']      # ['i'] is default
-noise_factor: 0.58          # 0.58 is default
+noise_factor: 1          # 0.58 is default
 dither: False               # False is default
 dither_size: 0.5            # 0.5 is default
 rotate: False               # False is default
@@ -29,7 +29,7 @@ cosmic_rays: True
 bad_columns: True       
 shear_setting: "vary"       # "vary" or "const"
 density: 80                 # per square arcmin, 80 is default  
-setting: test
+setting: WLD_80_no_star
 catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'
 select_observable: 'i_ab'   # column name in the WLDEBlend catalog
 select_lower_limit: null
@@ -46,3 +46,4 @@ star_config:
 star_filter_mag: 18
 star_filter: false
 star_filter_band: 'r'
+draw_bright: false

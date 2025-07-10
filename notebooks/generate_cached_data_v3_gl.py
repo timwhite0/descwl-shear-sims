@@ -19,11 +19,11 @@ from datetime import datetime
 import concurrent.futures
 import sys
 
-os.environ['CATSIM_DIR'] = '/data/scratch/taodingr/lsst_stack/catsim' 
+os.environ['CATSIM_DIR'] = '/scratch/regier_root/regier0/taodingr/descwl-shear-sims/catsim' 
 
 import shutil
 
-save_folder = f"/data/scratch/taodingr/weak_lensing/descwl"
+save_folder = f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output"
 total, used, free = shutil.disk_usage(save_folder)
 print(f"Disk space for {save_folder}:")
 print(f"  Total: {total // (2**30)} GiB")
@@ -457,7 +457,7 @@ def Generate_single_img_catalog(
             rotate=rotate,
             cosmic_rays=cosmic_rays,
             bad_columns=bad_columns,
-            star_bleeds=star_bleeds
+            star_bleeds=star_bleeds,
         )
     else:
         # generate galaxies and stars
@@ -555,7 +555,7 @@ def Generate_img_catalog(config, use_multiprocessing=False, use_threading=False,
         start_from: Start generating from this index (only used if resume_mode=False)
     """
     num_data = config['num_data']
-    save_folder = f"/data/scratch/taodingr/weak_lensing/descwl/{config['setting']}"
+    save_folder = f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output/{config['setting']}"
     
     # Initialize tensor manager
     tensor_manager = LargeTensorManager(config, save_folder)
@@ -903,9 +903,9 @@ def plot_magnitude_distribution(magnitudes, num_selected, config):
     plt.hist(mag_combined, bins=100)
     plt.xlabel("i-band ab magnitude")
     plt.ylabel("Count")
-    plt.savefig(f"/data/scratch/taodingr/lsst_stack/descwl-shear-sims/notebooks/magnitude_distribution.png")
+    plt.savefig(f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/notebooks/magnitude_distribution.png")
 
-def load_large_tensor_data(setting, data_folder="/data/scratch/taodingr/weak_lensing/descwl"):
+def load_large_tensor_data(setting, data_folder="/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output"):
     """
     Convenience function to load the large tensor data
     
@@ -977,7 +977,7 @@ def main():
         return
 
     # Load and verify the final results
-    save_folder = f"/data/scratch/taodingr/weak_lensing/descwl/{config['setting']}"
+    save_folder = f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output/{config['setting']}"
     if os.path.exists(save_folder):
         try:
             # Try loading the large tensors to verify
