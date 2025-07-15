@@ -2,17 +2,24 @@ use_multiprocessing: true  # Set to true only if serialization issues are resolv
 use_threading: false         # Recommended: good performance without serialization issues
 n_workers: 8        # Number of parallel workers (optional)
 stop_on_multiprocessing_fail: true
+batch_size: 50
+
+
+memory_management:
+  monitor_memory: false
+  batch_size: 50
+  aggressive_gc: true
 
 # Resume functionality
 resume_mode: true          # Set to true to automatically resume from existing files
 start_from: 0             # Only used if resume_mode is false - start from this index
-
 
 num_data: 2000            # number of images to generate
 ntrial: 1
 seed: 8312
 mag: 17.0                   # 17.0 is default
 hlr: 0.5                    # 0.5 is default
+variable_psf: false
 psf_type: "moffat"          # "moffat" or "gauss"
 morph: 'exp'                
 pixel_scale: 0.2            # 0.2 is default
@@ -29,7 +36,7 @@ cosmic_rays: True
 bad_columns: True       
 shear_setting: "vary"       # "vary" or "const"
 density: 80                 # per square arcmin, 80 is default  
-setting: WLD_80_no_star
+setting: WLD_80_no_star_noise_1_fix_psf
 catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'
 select_observable: 'i_ab'   # column name in the WLDEBlend catalog
 select_lower_limit: null
