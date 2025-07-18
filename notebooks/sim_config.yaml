@@ -19,7 +19,8 @@ ntrial: 1
 seed: 8312
 mag: 17.0                   # 17.0 is default
 hlr: 0.5                    # 0.5 is default
-variable_psf: false
+variable_psf: true
+variation_factor: 0.85
 psf_type: "moffat"          # "moffat" or "gauss"
 morph: 'exp'                
 pixel_scale: 0.2            # 0.2 is default
@@ -36,7 +37,7 @@ cosmic_rays: True
 bad_columns: True       
 shear_setting: "vary"       # "vary" or "const"
 density: 80                 # per square arcmin, 80 is default  
-setting: WLD_80_no_star_noise_1_fix_psf
+setting: WLD_80_no_star_noise_1_vary_psf_point_85
 catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'
 select_observable: 'i_ab'   # column name in the WLDEBlend catalog
 select_lower_limit: null

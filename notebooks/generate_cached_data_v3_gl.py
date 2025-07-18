@@ -42,7 +42,7 @@ def create_psf_for_worker(config, se_dim, rng_seed):
     worker_rng = np.random.RandomState(rng_seed)
     
     if config.get('variable_psf', False):
-        return make_ps_psf(rng=worker_rng, dim=se_dim)
+        return make_ps_psf(rng=worker_rng, dim=se_dim, variation_factor=config['variation_factor'])
     else:
         if config['psf_type'] == "gauss":
             return make_fixed_psf(psf_type=config['psf_type']) 
