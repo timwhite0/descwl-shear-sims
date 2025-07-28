@@ -1,26 +1,28 @@
 use_multiprocessing: true  # Set to true only if serialization issues are resolved
 use_threading: false         # Recommended: good performance without serialization issues
-n_workers: 8        # Number of parallel workers (optional)
+n_workers: 24        # Number of parallel workers (optional)
 stop_on_multiprocessing_fail: true
-batch_size: 50
-
+batch_size: 100
 
 memory_management:
   monitor_memory: false
-  batch_size: 50
+  batch_size: 100
   aggressive_gc: true
 
 # Resume functionality
 resume_mode: true          # Set to true to automatically resume from existing files
 start_from: 0             # Only used if resume_mode is false - start from this index
 
-num_data: 2000            # number of images to generate
+num_data: 400        # number of images to generate
 ntrial: 1
-seed: 8312
+seed: 42
 mag: 17.0                   # 17.0 is default
 hlr: 0.5                    # 0.5 is default
+
 variable_psf: true
-variation_factor: 0.85
+variation_factor: 1.0
+save_psf_param: false
+
 psf_type: "moffat"          # "moffat" or "gauss"
 morph: 'exp'                
 pixel_scale: 0.2            # 0.2 is default
@@ -36,22 +38,27 @@ rotate: False               # False is default
 cosmic_rays: True          
 bad_columns: True       
 shear_setting: "vary"       # "vary" or "const"
+
 density: 80                 # per square arcmin, 80 is default  
-setting: WLD_80_no_star_noise_1_vary_psf_point_85
-catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'
+
+setting: WLD_80_star_max_100_draw_bright_5
+
+
+catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'   
 select_observable: 'i_ab'   # column name in the WLDEBlend catalog
 select_lower_limit: null
 select_upper_limit: 27 
 n_tiles_per_side: 1
 
 # Star configuration
-star_catalog: null # set to null to disable star catalog
+star_catalog: true # set to null to disable star catalog
 star_bleeds: true 
 
-star_config: 
-    density: 80 # density, max_density or min_density
-
-star_filter_mag: 18
+star_config:
+  max_density: 100  # This is all you need for basic functionality
+  
+# These are handled separately (not passed to make_star_catalog):
 star_filter: false
+star_filter_mag: 18.0
 star_filter_band: 'r'
-draw_bright: false
+draw_bright: true
