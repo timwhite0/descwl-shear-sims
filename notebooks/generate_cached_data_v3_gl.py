@@ -5,26 +5,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 from descwl_shear_sims.galaxies import FixedGalaxyCatalog
 from descwl_shear_sims.galaxies import WLDeblendGalaxyCatalog
-from descwl_shear_sims.stars import StarCatalog, make_star_catalog, DEFAULT_STAR_CONFIG
+from descwl_shear_sims.stars import StarCatalog, make_star_catalog
 from descwl_shear_sims.sim import make_sim
 from descwl_shear_sims.psfs import make_fixed_psf
 from descwl_shear_sims.psfs import make_ps_psf
 from descwl_shear_sims.sim import get_se_dim
 from tqdm import tqdm
 from descwl_shear_sims.layout.layout import Layout
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 import time
 from datetime import datetime
 import concurrent.futures
-import sys
 import tempfile
 import shutil
 
 os.environ['CATSIM_DIR'] = '/scratch/regier_root/regier0/taodingr/descwl-shear-sims/catsim' 
-
-import shutil
-
 save_folder = f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output"
 total, used, free = shutil.disk_usage(save_folder)
 print(f"Disk space for {save_folder}:")
@@ -32,6 +28,117 @@ print(f"  Total: {total // (2**30)} GiB")
 print(f"  Used:  {used // (2**30)} GiB")
 print(f"  Free:  {free // (2**30)} GiB")
 space_available = free // (2**30)
+
+def cleanup_memory(aggressive=True):
+    if aggressive:
+        import gc
+        gc.collect()
+
+def safe_save_tensor(tensor, filepath, max_retries=3):
+    print(f"Saving to {os.path.basename(filepath)}...")
+    
+    if hasattr(tensor, 'detach'):
+        clean_tensor = tensor.detach().cpu().contiguous()
+    else:
+        clean_tensor = tensor
+    
+    target_dir = os.path.dirname(filepath)
+    target_filename = os.path.basename(filepath)
+    
+    for attempt in range(max_retries):
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix='.tmp',
+                prefix=f'{target_filename}.',
+                dir=target_dir,
+                delete=False
+            ) as temp_file:
+                temp_path = temp_file.name
+            
+            torch.save(clean_tensor, temp_path, _use_new_zipfile_serialization=False)
+            
+            temp_size = os.path.getsize(temp_path)
+            if temp_size < 100:
+                raise RuntimeError(f"File too small: {temp_size} bytes")
+            
+            shutil.move(temp_path, filepath)
+            
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 100:
+                size_mb = os.path.getsize(filepath) / (1024**2)
+                print(f"Saved successfully ({size_mb:.1f} MB)")
+                return True
+            else:
+                raise RuntimeError("Final file missing or corrupted")
+                
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+            
+            if attempt < max_retries - 1:
+                time.sleep(1)
+    
+    print(f"All save attempts failed for {filepath}")
+    return False
+
+def save_batch_to_disk(batch_manager, save_psf_params=True):
+    if batch_manager.current_batch_images is None:
+        print("No batch to save!")
+        return False
+    
+    print(f"Saving batch {batch_manager.current_batch_num}...")
+    
+    batch_image_file = f"{batch_manager.save_folder}/batch_{batch_manager.current_batch_num}_images.pt"
+    batch_catalog_file = f"{batch_manager.save_folder}/batch_{batch_manager.current_batch_num}_catalog.pt"
+    batch_psf_file = f"{batch_manager.save_folder}/batch_{batch_manager.current_batch_num}_psf_params.pt"
+    
+    image_success = safe_save_tensor(batch_manager.current_batch_images, batch_image_file)
+    catalog_success = safe_save_tensor(batch_manager.current_batch_catalog, batch_catalog_file)
+    
+    psf_success = True
+    if save_psf_params and batch_manager.current_batch_psf_params:
+        psf_success = safe_save_tensor(batch_manager.current_batch_psf_params, batch_psf_file)
+    
+    overall_success = image_success and catalog_success and psf_success
+    
+    if image_success or catalog_success:
+        batch_info = {
+            'batch_num': batch_manager.current_batch_num,
+            'batch_size': batch_manager.current_batch_size,
+            'image_file': batch_image_file if image_success else None,
+            'catalog_file': batch_catalog_file if catalog_success else None,
+            'psf_file': batch_psf_file if psf_success else None,
+            'image_shape': batch_manager.current_batch_images.shape if image_success else None,
+            'catalog_shape': batch_manager.current_batch_catalog["locs"].shape if catalog_success else None,
+        }
+        batch_manager.completed_batches.append(batch_info)
+    
+    if overall_success:
+        print(f"Batch {batch_manager.current_batch_num} saved successfully")
+    else:
+        print(f"Partial save - Images: {image_success}, Catalog: {catalog_success}, PSF: {psf_success}")
+    
+    print(f"Progress: {batch_manager.total_processed}/{batch_manager.total_images} images")
+    
+    clear_batch_memory(batch_manager)
+    return image_success
+
+def clear_batch_memory(batch_manager):
+    if batch_manager.current_batch_images is not None:
+        del batch_manager.current_batch_images
+        del batch_manager.current_batch_catalog
+        del batch_manager.current_batch_psf_params
+        
+        batch_manager.current_batch_images = None
+        batch_manager.current_batch_catalog = None
+        batch_manager.current_batch_psf_params = None
+    
+    cleanup_memory(aggressive=True)
+    print(f"Batch {batch_manager.current_batch_num} cleared from memory")
 
 def get_psf_param(psf_obj):
     # Create a grid of pixel positions
@@ -66,10 +173,6 @@ def get_psf_param(psf_obj):
     return dict
 
 def create_psf_for_worker(config, se_dim, rng_seed):
-    """
-    Create PSF inside the worker process to avoid serialization issues
-    """
-    # Create a new RNG for this worker
     worker_rng = np.random.RandomState(rng_seed)
     
     if config.get('variable_psf', False):
@@ -80,14 +183,11 @@ def create_psf_for_worker(config, se_dim, rng_seed):
         elif config['psf_type'] == "moffat":  
             return make_fixed_psf(psf_type=config['psf_type'], psf_fwhm=0.8)
 
-def process_single_image_for_accumulation_fixed(args):
-    """Function to process a single image - FIXED for PSF serialization"""
-    (iter_idx, config, g1_val, g2_val, rng_state, psf_config, layout, shifts, star_config) = args
+def process_single_image(args):
+    (iter_idx, config, g1_val, g2_val, rng_state, psf_config, layout, shifts, star_config, generate_star, star_setting) = args
     
-    # Create new RNG with the passed state
     rng = np.random.RandomState()
     rng.set_state(rng_state)
-    # Advance the RNG state for this iteration to ensure uniqueness
     for _ in range(iter_idx):
         rng.rand()
     
@@ -98,12 +198,12 @@ def process_single_image_for_accumulation_fixed(args):
 
     
     each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
-        1, rng, config['mag'], config['hlr'], psf, config['morph'], 
+        rng, config['mag'], config['hlr'], psf, config['morph'], 
         config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
         config['sep'], g1_val, g2_val, config['bands'], config['noise_factor'], 
         config['dither'], config['dither_size'], config['rotate'], 
         config['cosmic_rays'], config['bad_columns'], config['star_bleeds'], 
-        star_config, shifts, config['catalog_type'], config['select_observable'],  
+        star_config, generate_star, star_setting, shifts, config['catalog_type'], config['select_observable'],  
         config['select_lower_limit'], config['select_upper_limit'], config['draw_bright']
     )
     
@@ -116,236 +216,6 @@ def process_single_image_for_accumulation_fixed(args):
                              w_center - half_crop:w_center + half_crop]
     
     return iter_idx, single_image, positions_tensor, M, magnitude, psf_param
-
-def ultra_robust_atomic_save(tensor, filepath, max_retries=5, skip_verification=False):
-    """
-    Ultra-robust save using atomic writes in the SAME directory
-    Added skip_verification parameter for PSF params with numpy scalars
-    """
-    print(f"    Saving tensor to {os.path.basename(filepath)}...")
-    
-    target_dir = os.path.dirname(filepath)
-    target_filename = os.path.basename(filepath)
-    
-    # Strategy 1: Atomic write in same directory
-    for attempt in range(max_retries):
-        try:
-            print(f"      Attempt {attempt + 1}: Atomic write in same directory")
-            
-            # Create temporary file in SAME directory for atomic move
-            temp_fd, temp_path = tempfile.mkstemp(
-                suffix='.tmp', 
-                prefix=f'{target_filename}.', 
-                dir=target_dir
-            )
-            os.close(temp_fd)  # Close file descriptor, we'll use the path
-            
-            # Prepare clean tensor
-            if hasattr(tensor, 'detach'):
-                clean_tensor = tensor.detach().cpu().contiguous()
-            else:
-                clean_tensor = tensor
-            
-            # Force sync before write
-            os.sync()
-            time.sleep(0.1)  # Small delay to let I/O settle
-            
-            # Save to temporary file with most compatible format
-            torch.save(clean_tensor, temp_path, _use_new_zipfile_serialization=False)
-            
-            # Force sync after write
-            os.sync()
-            time.sleep(0.1)
-            
-            # Verify temp file is complete and not corrupted
-            temp_size = os.path.getsize(temp_path)
-            if temp_size < 100:  # Less than 100 bytes is suspicious for most files
-                raise RuntimeError(f"Temp file suspiciously small: {temp_size} bytes")
-            
-            # Quick verification by attempting to load (skip for PSF params with numpy scalars)
-            if not skip_verification:
-                try:
-                    test_load = torch.load(temp_path, weights_only=True, map_location='cpu')
-                    if hasattr(tensor, 'shape') and hasattr(test_load, 'shape'):
-                        if test_load.shape != tensor.shape:
-                            raise RuntimeError(f"Shape verification failed: {test_load.shape} vs {tensor.shape}")
-                    del test_load
-                except Exception as e:
-                    # If weights_only fails, try without weights_only for verification
-                    try:
-                        test_load = torch.load(temp_path, weights_only=False, map_location='cpu')
-                        print(f"      ⚠️  Verification passed with weights_only=False")
-                        del test_load
-                    except Exception as e2:
-                        raise RuntimeError(f"Verification load failed: {e2}")
-            else:
-                print(f"      ⚠️  Skipping verification for PSF parameters")
-            
-            # Atomic move (this is the critical part)
-            shutil.move(temp_path, filepath)
-            
-            # Final verification
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 100:
-                final_size_mb = os.path.getsize(filepath) / (1024**2)
-                print(f"      ✅ Atomic save successful ({final_size_mb:.1f} MB)")
-                return True
-            else:
-                raise RuntimeError("Final file missing or too small after atomic move")
-                
-        except Exception as e:
-            print(f"      ❌ Atomic attempt {attempt + 1} failed: {e}")
-            
-            # Clean up any temp files
-            if 'temp_path' in locals() and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-            
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt)  # Exponential backoff
-                print(f"      Waiting {wait_time}s before retry...")
-                time.sleep(wait_time)
-    
-    # Strategy 2: Non-ZIP format fallback (still same directory)
-    print(f"      Trying legacy format in same directory...")
-    try:
-        temp_fd, temp_path = tempfile.mkstemp(
-            suffix='.tmp', 
-            prefix=f'{target_filename}.legacy.', 
-            dir=target_dir
-        )
-        os.close(temp_fd)
-        
-        if hasattr(tensor, 'detach'):
-            clean_tensor = tensor.detach().cpu().contiguous()
-        else:
-            clean_tensor = tensor
-        
-        # Use older, more reliable format
-        torch.save(clean_tensor, temp_path, _use_new_zipfile_serialization=False)
-        
-        # Verify and move
-        if os.path.getsize(temp_path) > 100:
-            shutil.move(temp_path, filepath)
-            
-            if os.path.exists(filepath):
-                print(f"      ✅ Legacy format save successful ({os.path.getsize(filepath) / (1024**2):.1f} MB)")
-                return True
-        
-    except Exception as e:
-        print(f"      ❌ Legacy format failed: {e}")
-        if 'temp_path' in locals() and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except:
-                pass
-    
-    # Strategy 3: Uncompressed format (same directory)
-    print(f"      Trying uncompressed format in same directory...")
-    try:
-        temp_fd, temp_path = tempfile.mkstemp(
-            suffix='.tmp', 
-            prefix=f'{target_filename}.uncompressed.', 
-            dir=target_dir
-        )
-        os.close(temp_fd)
-        
-        if hasattr(tensor, 'detach'):
-            clean_tensor = tensor.detach().cpu().contiguous()
-        else:
-            clean_tensor = tensor
-        
-        # Save without compression
-        with open(temp_path, 'wb') as f:
-            torch.save(clean_tensor, f)
-        
-        if os.path.getsize(temp_path) > 100:
-            shutil.move(temp_path, filepath)
-            
-            if os.path.exists(filepath):
-                print(f"      ✅ Uncompressed save successful ({os.path.getsize(filepath) / (1024**2):.1f} MB)")
-                return True
-        
-    except Exception as e:
-        print(f"      ❌ Uncompressed format failed: {e}")
-        if 'temp_path' in locals() and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except:
-                pass
-    
-    print(f"      ❌ All atomic save strategies failed for {filepath}")
-    return False
-
-def wait_for_filesystem_stability(directory, max_wait=30):
-    """
-    Wait for filesystem to become stable before critical operations
-    """
-    print(f"    Waiting for filesystem stability...")
-    
-    start_time = time.time()
-    while time.time() - start_time < max_wait:
-        try:
-            # Test basic I/O
-            test_file = os.path.join(directory, f'stability_test_{int(time.time())}.tmp')
-            with open(test_file, 'w') as f:
-                f.write('test')
-            
-            # Read it back
-            with open(test_file, 'r') as f:
-                content = f.read()
-            
-            os.remove(test_file)
-            
-            if content == 'test':
-                print(f"    ✅ Filesystem stable after {time.time() - start_time:.1f}s")
-                return True
-                
-        except Exception:
-            time.sleep(1)
-            continue
-    
-    print(f"    ⚠️  Filesystem still unstable after {max_wait}s")
-    return False
-
-def safe_tensor_copy(tensor):
-    """
-    Create a safe copy of a tensor for saving
-    """
-    try:
-        if hasattr(tensor, 'detach'):
-            # PyTorch tensor
-            safe_tensor = tensor.detach().cpu().contiguous().clone()
-            # Force memory cleanup
-            del tensor
-            import gc
-            gc.collect()
-            return safe_tensor
-        else:
-            # Already a safe tensor or other type
-            return tensor
-    except Exception as e:
-        print(f"      ⚠️  Tensor copy failed: {e}, using original")
-        return tensor
-
-def ultra_robust_catalog_save_improved(catalog_dict, filepath):
-    """Improved catalog save with atomic writes"""
-    print(f"    Saving catalog to {os.path.basename(filepath)}...")
-    
-    try:
-        # Create safe copies of all tensors
-        safe_catalog = {}
-        for key, tensor in catalog_dict.items():
-            print(f"      Processing {key}...")
-            safe_catalog[key] = safe_tensor_copy(tensor)
-        
-        # Use the improved atomic save
-        return ultra_robust_atomic_save(safe_catalog, filepath)
-        
-    except Exception as e:
-        print(f"    ❌ Catalog processing failed: {e}")
-        return False
 
 class StreamingBatchTensorManager:
     """
@@ -362,7 +232,7 @@ class StreamingBatchTensorManager:
         self.batch_size = config.get('batch_size', 200)
         
         # Tiling configuration - NEW
-        self.n_tiles_per_side = config.get('n_tiles_per_side', 4)  # Default 4x4 tiling
+        self.n_tiles_per_side = config.get('n_tiles_per_side', 8)  # Default 8x8 tiling
         self.image_size = 2048  # Assuming 2048x2048 images
         self.tile_size = self.image_size // self.n_tiles_per_side
         
@@ -377,7 +247,7 @@ class StreamingBatchTensorManager:
         self.current_batch_size = 0
         self.current_batch_psf_params = None
         
-        # Track completed batches (only metadata, not tensors)
+        # Track completed batches 
         self.completed_batches = []
         
         # Progress tracking
@@ -386,32 +256,17 @@ class StreamingBatchTensorManager:
         # Create save folder
         os.makedirs(save_folder, exist_ok=True)
         
-        print(f"Streaming batch processing configuration:")
-        print(f"  Total images: {self.total_images}")
-        print(f"  Batch size: {self.batch_size}")
-        print(f"  Number of batches: {(self.total_images + self.batch_size - 1) // self.batch_size}")
-        print(f"  Memory strategy: Process one batch at a time (streaming)")
-        
         # NEW: Tiling info
         print(f"  Tiles per side: {self.n_tiles_per_side}")
         print(f"  Tile size: {self.tile_size}x{self.tile_size} pixels")
         print(f"  Total tiles per image: {self.n_tiles_per_side * self.n_tiles_per_side}")
 
     def start_new_batch(self, batch_start_idx):
-        """Start a new batch and clear previous batch from memory - UNCHANGED"""
+        """Start a new batch and clear previous batch from memory"""
         # Clear previous batch completely
         if self.current_batch_images is not None:
-            del self.current_batch_images
-            del self.current_batch_catalog
-            del self.current_batch_psf_params
-            self.current_batch_images = None
-            self.current_batch_catalog = None
-            self.current_batch_psf_params = None
-            
-            # Force garbage collection
-            import gc
-            gc.collect()
-            print(f"🗑️  Previous batch cleared from memory")
+            clear_batch_memory(self)
+            print(f"Previous batch cleared from memory")
         
         self.current_batch_num = batch_start_idx // self.batch_size + 1
         batch_end_idx = min(batch_start_idx + self.batch_size, self.total_images)
@@ -422,7 +277,7 @@ class StreamingBatchTensorManager:
         print(f"Memory available: {self._get_available_memory():.1f} GB")
         
     def _get_available_memory(self):
-        """Get available memory in GB - UNCHANGED"""
+        """Get available memory in GB"""
         try:
             import psutil
             return psutil.virtual_memory().available / (1024**3)
@@ -431,7 +286,7 @@ class StreamingBatchTensorManager:
 
     def assign_sources_to_tiles(self, positions, g1, g2):
         """
-        NEW METHOD: Assign sources to tiles based on their positions
+        Assign sources to tiles based on their positions
         
         Returns:
             tile_assignments: dict with tile coordinates as keys and source lists as values
@@ -456,7 +311,6 @@ class StreamingBatchTensorManager:
                     'g2_values': []
                 }
             
-            # Convert to tile-local coordinates
             local_x = x - (tile_x * self.tile_size)
             local_y = y - (tile_y * self.tile_size)
             
@@ -466,28 +320,21 @@ class StreamingBatchTensorManager:
         
         return tile_assignments
         
-    def initialize_batch_tensors(self, sample_image, sample_positions, sample_M, sample_g1, sample_g2):
-        """Initialize tensors for current batch with TILED structure - MODIFIED"""
+    def initialize_batch_tensors(self, sample_image, sample_M):
+        """Initialize tensors for current batch with TILED structure"""
         print(f"Initializing tiled batch tensors for {self.current_batch_size} images...")
         
         # Image tensor dimensions: [batch_size, channels, height, width] - UNCHANGED
         channels, height, width = sample_image.shape
-        
-        # Calculate memory requirement
-        batch_memory_gb = (self.current_batch_size * channels * height * width * 4) / (1024**3)
         print(f"Batch image tensor: [{self.current_batch_size}, {channels}, {height}, {width}]")
-        print(f"Estimated batch memory: {batch_memory_gb:.2f} GB")
         
-        # Initialize batch image tensor - UNCHANGED
+        # Initialize batch image tensor 
         self.current_batch_images = torch.zeros(self.current_batch_size, channels, height, width, dtype=torch.float32)
         
-        # MODIFIED: For tiled catalog, estimate max sources per tile
+        # For tiled catalog, estimate max sources per tile
         total_sources_estimate = sample_M
         max_sources_per_tile = max(10, total_sources_estimate // (self.n_tiles_per_side ** 2) * 3)  # 3x safety factor
-        
-        catalog_memory_gb = (self.current_batch_size * self.n_tiles_per_side * self.n_tiles_per_side * max_sources_per_tile * 8) / (1024**3)
         print(f"Max sources per tile estimate: {max_sources_per_tile}")
-        print(f"Estimated catalog memory: {catalog_memory_gb:.2f} GB")
         
         # Tiled catalog tensor structure
         self.current_batch_catalog = {
@@ -503,29 +350,22 @@ class StreamingBatchTensorManager:
 
         # Initialize PSF parameters dictionary
         self.current_batch_psf_params = {}
-        
-        print(f"✅ Tiled batch tensors and PSF params initialized successfully!")
-        print(f"📊 Catalog shape: {self.current_batch_catalog['locs'].shape}")
-        print(f"📊 Total estimated batch memory: {batch_memory_gb + catalog_memory_gb:.2f} GB")
 
     def add_image_to_batch(self, global_idx, image, positions, n_sources, g1, g2, psf_param=None):
-        """Add a single image to the current batch with TILED catalog structure - COMPLETELY MODIFIED"""
+        """Add a single image to the current batch with TILED catalog structure"""
         # Calculate local index within current batch
         batch_start_idx = (self.current_batch_num - 1) * self.batch_size
         local_idx = global_idx - batch_start_idx
         
         if self.current_batch_images is None:
-            self.initialize_batch_tensors(image, positions, n_sources, g1, g2)
+            self.initialize_batch_tensors(image, n_sources)
         
-        # Add image (remove batch dimension if present) - UNCHANGED
+        # Add image (remove batch dimension if present)
         if len(image.shape) == 4:
             image = image.squeeze(0)
         self.current_batch_images[local_idx] = image
-        
-        # NEW: Assign sources to tiles
+
         tile_assignments = self.assign_sources_to_tiles(positions.numpy(), g1, g2)
-        
-        # NEW: Populate tiled catalog
         max_sources_per_tile = self.current_batch_catalog["locs"].shape[3]
         
         for (tile_row, tile_col), tile_data in tile_assignments.items():
@@ -553,14 +393,14 @@ class StreamingBatchTensorManager:
                 self.current_batch_catalog["shear_1"][local_idx, tile_row, tile_col, :n_tile_sources] = g1_tensor
                 self.current_batch_catalog["shear_2"][local_idx, tile_row, tile_col, :n_tile_sources] = g2_tensor
         
-        # NEW: Add PSF parameters
+        # Add PSF parameters
         if psf_param is not None:
             self.current_batch_psf_params[local_idx] = psf_param
 
         self.total_processed += 1
 
     def _expand_batch_catalog_tensors(self, new_max_sources):
-        """NEW METHOD: Expand batch catalog tensors to accommodate more sources per tile"""
+        """Expand batch catalog tensors to accommodate more sources per tile"""
         old_max = self.current_batch_catalog["locs"].shape[3]
         batch_size, n_tiles_y, n_tiles_x = self.current_batch_catalog["locs"].shape[:3]
         
@@ -581,137 +421,17 @@ class StreamingBatchTensorManager:
         self.current_batch_catalog["locs"] = new_locs
         self.current_batch_catalog["shear_1"] = new_shear_1
         self.current_batch_catalog["shear_2"] = new_shear_2
-        
-    def save_current_batch_to_disk_improved(self, save_psf_param=True):
-        """Save current batch with filesystem stability checks"""
-        if self.current_batch_images is None:
-            print("❌ No batch to save!")
-            return False
             
-        print(f"💾 Saving batch {self.current_batch_num} to disk...")
-        
-        # Wait for filesystem stability
-        if not wait_for_filesystem_stability(self.save_folder):
-            print("⚠️  Proceeding despite filesystem instability...")
-        
-        # Create safe copies before saving to prevent corruption
-        print(f"  Creating safe tensor copies...")
-        safe_images = safe_tensor_copy(self.current_batch_images)
-        safe_catalog = {}
-        for key, tensor in self.current_batch_catalog.items():
-            safe_catalog[key] = safe_tensor_copy(tensor)
-    
-        # NEW: Create safe copy of PSF parameters
-        safe_psf_params = self.current_batch_psf_params.copy() if self.current_batch_psf_params else {}
-
-        # Force memory cleanup and system sync
-        import gc
-        gc.collect()
-        os.sync()  # Force all pending I/O to complete
-        time.sleep(0.5)  # Let I/O settle
-        
-        # Save batch files
-        batch_image_file = f"{self.save_folder}/batch_{self.current_batch_num}_images.pt"
-        batch_catalog_file = f"{self.save_folder}/batch_{self.current_batch_num}_catalog.pt"
-        batch_psf_file = f"{self.save_folder}/batch_{self.current_batch_num}_psf_params.pt"
-        
-        # Save images with improved atomic method
-        print(f"  Saving images with improved atomic method...")
-        image_save_success = ultra_robust_atomic_save(safe_images, batch_image_file)
-        
-        # Wait between saves to reduce I/O pressure
-        if image_save_success:
-            print(f"  Waiting for I/O to settle before catalog save...")
-            time.sleep(2)
-            os.sync()
-    
-        # Save catalog with improved atomic method
-        print(f"  Saving catalog with improved atomic method...")
-        catalog_save_success = ultra_robust_catalog_save_improved(safe_catalog, batch_catalog_file)
-
-        if save_psf_param:
-            print(f"  Saving PSF parameters...")
-            psf_save_success = ultra_robust_atomic_save(safe_psf_params, batch_psf_file, skip_verification=True)
-            overall_success = image_save_success and catalog_save_success and psf_save_success
-
-            if overall_success:
-                print(f"✅ Images, catalog, and PSF params saved successfully")
-            else:
-                print(f"⚠️  Partial save - Images: {image_save_success}, Catalog: {catalog_save_success}, PSF: {psf_save_success}")
-
-        else:
-            psf_save_success = False
-            overall_success = image_save_success and catalog_save_success
-            if overall_success:
-                print(f"✅ Images and catalog saved successfully, do not save psf parameters")
-            else:
-                print(f"⚠️  Partial save - Images: {image_save_success}, Catalog: {catalog_save_success}")
-        
-            
-        # Record batch metadata (even for partial success)
-        if image_save_success or catalog_save_success:
-            batch_info = {
-                'batch_num': self.current_batch_num,
-                'batch_size': self.current_batch_size,
-                'image_file': batch_image_file if image_save_success else None,
-                'catalog_file': batch_catalog_file if catalog_save_success else None,
-                'psf_file': batch_psf_file if psf_save_success else None,
-                'image_shape': safe_images.shape if image_save_success else None,
-                'catalog_shape': safe_catalog["locs"].shape if catalog_save_success else None,
-                'partial_save': not overall_success
-            }
-            self.completed_batches.append(batch_info)
-            
-            print(f"📁 Files saved:")
-            if image_save_success:
-                print(f"  ✅ Images: {os.path.basename(batch_image_file)}")
-            if catalog_save_success:
-                print(f"  ✅ Catalog: {os.path.basename(batch_catalog_file)}")
-            if save_psf_param and psf_save_success:
-                print(f"  ✅ PSF Params: {os.path.basename(batch_psf_file)}")
-
-        
-        print(f"📊 Progress: {self.total_processed}/{self.total_images} images")
-    
-        # Clear current batch from memory immediately
-        del self.current_batch_images
-        del self.current_batch_catalog
-        del self.current_batch_psf_params 
-        del safe_images
-        del safe_catalog
-        del safe_psf_params
-        self.current_batch_images = None
-        self.current_batch_catalog = None
-        self.current_batch_psf_params = None
-        
-        # Force garbage collection and sync
-        gc.collect()
-        os.sync()
-        
-        print(f"🗑️  Batch {self.current_batch_num} cleared from memory")
-        print(f"💾 Available memory: {self._get_available_memory():.1f} GB")
-        
-        # Return True if at least images were saved (most important part)
-        return image_save_success
-
 def filter_bright_stars_production(star_catalog, mag_threshold=18, band='r', verbose=True):
     """
     Production-ready bright star filter for massive performance gains
-    
-    Based on test results:
-    - mag_threshold=18: 91.6% faster (removes stars that go through draw_bright_star)
-    - mag_threshold=15: 29.4% faster (removes only very bright stars)
-    
+
     Parameters:
     -----------
     star_catalog : StarCatalog
         Original star catalog from make_star_catalog()
     mag_threshold : float
         Magnitude threshold - stars brighter (lower mag) than this will be removed
-        Recommended values:
-        - 18.0: Maximum speedup (91.6% faster)
-        - 15.0: Conservative speedup (29.4% faster) 
-        - 16.0: Moderate speedup (49.9% faster)
     band : str
         Band to use for magnitude filtering (default: 'r')
     verbose : bool
@@ -747,7 +467,6 @@ def filter_bright_stars_production(star_catalog, mag_threshold=18, band='r', ver
     magnitudes = star_data[mag_column][current_indices]
     
     # Create mask to keep only non-bright stars (mag >= threshold)
-    # Lower magnitude = brighter star, so we keep stars with mag >= threshold
     keep_mask = np.isfinite(magnitudes) & (magnitudes >= mag_threshold)
     n_kept = np.sum(keep_mask)
     n_removed = n_original - n_kept
@@ -767,11 +486,11 @@ def filter_bright_stars_production(star_catalog, mag_threshold=18, band='r', ver
     # Create filtered catalog
     filtered_catalog = StarCatalog(
         rng=star_catalog.rng,
-        layout='random',  # Will be overridden
-        coadd_dim=600,    # Will be overridden  
-        buff=0,           # Will be overridden
-        pixel_scale=0.2,  # Will be overridden
-        density=n_kept,   # Approximate density
+        layout='random',  
+        coadd_dim=600,    
+        buff=0,           
+        pixel_scale=0.2,  
+        density=n_kept,   
     )
     
     # Copy filtered data
@@ -781,23 +500,19 @@ def filter_bright_stars_production(star_catalog, mag_threshold=18, band='r', ver
     filtered_catalog.density = star_catalog.density * (n_kept / n_original)
     
     if verbose:
-        print(f"✅ Filtered catalog created: {len(filtered_catalog)} stars")
-        print(f"🚀 Expected to prevent {n_removed} expensive draw_bright_star() calls")
+        print(f"Filtered catalog created: {len(filtered_catalog)} stars")
+        print(f"Expected to prevent {n_removed} expensive draw_bright_star() calls")
     
     return filtered_catalog
 
 def Generate_single_img_catalog(
-    ntrial, rng, mag, hlr, psf, morph, pixel_scale, layout, coadd_dim, buff, sep, g1, g2, bands, 
-    noise_factor, dither, dither_size, rotate, cosmic_rays, bad_columns, star_bleeds, star_config, shifts,
-    catalog_type, select_observable, select_lower_limit, select_upper_limit, draw_bright, 
+    rng, mag, hlr, psf, morph, pixel_scale, layout, coadd_dim, buff, sep, g1, g2, bands, 
+    noise_factor, dither, dither_size, rotate, cosmic_rays, bad_columns, star_bleeds, star_config, 
+    generate_star, star_setting, shifts, catalog_type, select_observable, select_lower_limit, select_upper_limit, draw_bright, 
     ):
     """
-    Generate one catalog and image - optimized version
+    Generate one catalog and image 
     """
-    # Remove unnecessary loop - ntrial should always be 1 for single image generation
-    if ntrial != 1:
-        print("Warning: ntrial should be 1 for single image generation")
-
     if catalog_type == 'wldeblend':
         galaxy_catalog = WLDeblendGalaxyCatalog(
         rng=rng,
@@ -835,12 +550,10 @@ def Generate_single_img_catalog(
         galaxy_catalog.shifts_array = shifts
         magnitude = []
 
-    # NEW: CREATE STAR CATALOG PER IMAGE
-    star_catalog = None
-    if star_config is not None:
-        print(f"Creating new star catalog for this image...")
+    # CREATE STAR CATALOG PER IMAGE
+    if generate_star:
         star_catalog = make_star_catalog(
-            rng=rng,  # This RNG will be in a different state for each image
+            rng=rng,  
             coadd_dim=coadd_dim,
             buff=buff,
             pixel_scale=pixel_scale,
@@ -848,34 +561,16 @@ def Generate_single_img_catalog(
         )
         
         # Apply filtering if configured
-        star_filter = star_config.get('star_filter', False)
+        star_filter = star_setting.get('star_filter', False)
         if star_filter:
             star_catalog = filter_bright_stars_production(
                 star_catalog, 
-                mag_threshold=star_config.get('star_filter_mag', 18), 
-                band=star_config.get('star_filter_band', 'r'), 
+                mag_threshold=star_setting.get('star_filter_mag', 18), 
+                band=star_setting.get('star_filter_band', 'r'), 
                 verbose=False  # Set to False to reduce log spam
             )
 
-    if star_catalog is None:
-        # only generate galaxies
-        sim_data = make_sim(
-            rng=rng,
-            galaxy_catalog=galaxy_catalog,
-            coadd_dim=coadd_dim,
-            g1=g1,
-            g2=g2,
-            bands=bands,
-            psf=psf,
-            noise_factor=noise_factor,
-            dither=dither,
-            dither_size=dither_size,
-            rotate=rotate,
-            cosmic_rays=cosmic_rays,
-            bad_columns=bad_columns,
-            star_bleeds=star_bleeds,
-        )
-    else:
+    if generate_star:
         # generate galaxies and stars
         sim_data = make_sim(
             rng=rng,
@@ -894,15 +589,31 @@ def Generate_single_img_catalog(
             bad_columns=bad_columns,
             star_bleeds=star_bleeds,
             draw_bright=draw_bright,
-        )
+        )    
+    else:
+        # only generate galaxies
+        sim_data = make_sim(
+            rng=rng,
+            galaxy_catalog=galaxy_catalog,
+            coadd_dim=coadd_dim,
+            g1=g1,
+            g2=g2,
+            bands=bands,
+            psf=psf,
+            noise_factor=noise_factor,
+            dither=dither,
+            dither_size=dither_size,
+            rotate=rotate,
+            cosmic_rays=cosmic_rays,
+            bad_columns=bad_columns,
+            star_bleeds=star_bleeds,
+        )    
 
     # get the truth (source) information
     truth = sim_data['truth_info']
     image_x_positions = truth['image_x']
     image_y_positions = truth['image_y']
-    
-    # Fix numpy array memory layout issues for multiprocessing
-    # Copy arrays to ensure contiguous memory layout
+
     x_pos_copy = np.array(image_x_positions, copy=True)
     y_pos_copy = np.array(image_y_positions, copy=True)
     
@@ -913,12 +624,10 @@ def Generate_single_img_catalog(
     
     M = len(image_x_positions)
 
-    # Pre-allocate list for better performance
     n_bands = len(bands)
     first_band = bands[0]
     h, w = sim_data['band_data'][first_band][0].image.array.shape
     
-    # Pre-allocate tensor
     image_tensor = torch.zeros(n_bands, h, w, dtype=torch.float32)
     
     for i, band in enumerate(bands):
@@ -927,40 +636,9 @@ def Generate_single_img_catalog(
     
     return image_tensor, positions_tensor, M, magnitude
 
-def process_single_image_for_accumulation(args):
-    """Function to process a single image for accumulation into large tensors"""
-    (iter_idx, config, g1_val, g2_val, rng_state, psf, layout, shifts, star_catalog) = args
-    
-    # Create new RNG with the passed state
-    rng = np.random.RandomState()
-    rng.set_state(rng_state)
-    # Advance the RNG state for this iteration to ensure uniqueness
-    for _ in range(iter_idx):
-        rng.rand()
-    
-    each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
-        1, rng, config['mag'], config['hlr'], psf, config['morph'], 
-        config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
-        config['sep'], g1_val, g2_val, config['bands'], config['noise_factor'], 
-        config['dither'], config['dither_size'], config['rotate'], 
-        config['cosmic_rays'], config['bad_columns'], config['star_bleeds'], 
-        star_catalog, shifts, config['catalog_type'], config['select_observable'], 
-        config['select_lower_limit'], config['select_upper_limit'], config['draw_bright']
-    )
-    
-    crop_size = 2048
-    h_center, w_center = each_image.shape[1] // 2, each_image.shape[2] // 2
-    half_crop = crop_size // 2
-    
-    single_image = each_image[:, 
-                             h_center - half_crop:h_center + half_crop,
-                             w_center - half_crop:w_center + half_crop]
-    
-    return iter_idx, single_image, positions_tensor, M, magnitude
-
-def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=False, use_threading=False, n_workers=None, resume_mode=False, start_from=0, stop_on_multiprocessing_fail=True):
+def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=False, n_workers=None, stop_on_multiprocessing_fail=True):
     """
-    Generate images using streaming batch processing - BATCH ONLY VERSION (NO COMBINATION)
+    Generate images using streaming batch processing, supports sequential and multiprocessing modes 
     """
     num_data = config['num_data']
     
@@ -994,12 +672,12 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
             return "Memory info unavailable"
     
     if monitor_memory:
-        print(f"💾 Initial memory status: {get_memory_status()}")
+        print(f"Initial memory status: {get_memory_status()}")
     
     # Basic setup
     rng = np.random.RandomState(config['seed'])
     input_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
-    print(f"The input image dimension is {input_dim}")
+    print(f"The original input image dimension is {input_dim}")
     
     # Pre-generate all shear values
     if config['shear_setting'] == "const":
@@ -1020,7 +698,7 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
 
     shifts = layout.get_shifts(rng, density=config['density'])
     
-    # Process in batches - BATCH GENERATION ONLY
+    # Process in batches 
     successful_batches = 0
     total_batches = (num_data + batch_size - 1) // batch_size
     
@@ -1033,7 +711,7 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
         
         # Memory check before starting new batch
         if monitor_memory:
-            print(f"💾 Memory before batch: {get_memory_status()}")
+            print(f"Memory before batch: {get_memory_status()}")
         
         # Start new batch (clears previous batch from memory)
         batch_manager.start_new_batch(batch_start)
@@ -1043,8 +721,8 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
         
         print(f"Generating {len(batch_indices)} images...")
         
-        # ===== SEQUENTIAL PROCESSING (Most Reliable) =====
-        if not use_multiprocessing and not use_threading:
+        # ===== SEQUENTIAL PROCESSING =====
+        if not use_multiprocessing:
             print("Using sequential processing")
             
             # Create PSF once for sequential processing
@@ -1053,12 +731,13 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
             
             for iter_idx in tqdm(batch_indices, desc=f"Batch {batch_num}"):
                 each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
-                    1, rng, config['mag'], config['hlr'], psf, config['morph'], 
+                    rng, config['mag'], config['hlr'], psf, config['morph'], 
                     config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
                     config['sep'], g1[iter_idx], g2[iter_idx], config['bands'], 
                     config['noise_factor'], config['dither'], config['dither_size'], 
                     config['rotate'], config['cosmic_rays'], config['bad_columns'], 
-                    config['star_bleeds'], star_catalog, shifts, config['catalog_type'], 
+                    config['star_bleeds'], config.get('star_config'), config['generate_star'], 
+                    config.get('star_setting'), shifts, config['catalog_type'], 
                     config['select_observable'], config['select_lower_limit'], 
                     config['select_upper_limit'], config['draw_bright']
                 )
@@ -1073,11 +752,10 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
                 batch_manager.add_image_to_batch(iter_idx, single_image, positions_tensor, M, g1[iter_idx], g2[iter_idx])
                 
                 if aggressive_gc and iter_idx % 3 == 0:
-                    import gc
-                    gc.collect()
+                    cleanup_memory(aggressive=True)
         
-        # ===== MULTIPROCESSING (If Enabled) =====
-        elif use_multiprocessing:
+        # ===== MULTIPROCESSING =====
+        else:
             if n_workers is None:
                 n_workers = min(mp.cpu_count(), len(batch_indices), 6)
             
@@ -1098,11 +776,12 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
                 for iter_idx in batch_indices:
                     args_list.append((
                         iter_idx, config, g1[iter_idx], g2[iter_idx], 
-                        rng_state, psf_config, layout, shifts, config.get('star_config')
+                        rng_state, psf_config, layout, shifts, 
+                        config.get('star_config'), config['generate_star'], config.get('star_setting')
                     ))
                 
                 with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                    future_to_idx = {executor.submit(process_single_image_for_accumulation_fixed, args): args[0] for args in args_list}
+                    future_to_idx = {executor.submit(process_single_image, args): args[0] for args in args_list}
                     
                     for future in tqdm(
                         concurrent.futures.as_completed(future_to_idx),
@@ -1115,89 +794,38 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
                             iter_idx, single_image, positions_tensor, M, g1[iter_idx], g2[iter_idx], psf_param)
                         
                         if aggressive_gc and iter_idx % 5 == 0:
-                            import gc
-                            gc.collect()
+                            cleanup_memory(aggressive=True)
                 
-                print(f"✅ Multiprocessing completed for batch {batch_num}")
+                print(f"Multiprocessing completed for batch {batch_num}")
             
             except Exception as e:
-                print(f"❌ Multiprocessing failed: {e}")
+                print(f"Multiprocessing failed: {e}")
                 if stop_on_multiprocessing_fail:
                     print("Stopping due to multiprocessing failure")
                     break
         
-        # ===== THREADING (If Enabled) =====
-        elif use_threading:
-            if n_workers is None:
-                n_workers = min(4, len(batch_indices))
-            
-            print(f"Using threading with {n_workers} workers")
-            
-            def process_batch_image(iter_idx):
-                thread_rng = np.random.RandomState(config['seed'] + iter_idx * 1000)
-                se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
-                thread_psf = create_psf_for_worker(config, se_dim, config['seed'] + iter_idx)
-                
-                each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
-                    1, thread_rng, config['mag'], config['hlr'], thread_psf, config['morph'], 
-                    config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
-                    config['sep'], g1[iter_idx], g2[iter_idx], config['bands'], 
-                    config['noise_factor'], config['dither'], config['dither_size'], 
-                    config['rotate'], config['cosmic_rays'], config['bad_columns'], 
-                    config['star_bleeds'], star_catalog, shifts,
-                    config['catalog_type'], config['select_observable'], config['select_lower_limit'], 
-                    config['select_upper_limit'], config['draw_bright']
-                )
-                
-                # Crop image
-                H, W = each_image.shape[1], each_image.shape[2]
-                crop_size = 2048
-                start_h = (H - crop_size) // 2
-                start_w = (W - crop_size) // 2
-                single_image = each_image[:, start_h:start_h + crop_size, start_w:start_w + crop_size]
-                
-                return iter_idx, single_image, positions_tensor, M, magnitude
-            
-            with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                future_to_idx = {executor.submit(process_batch_image, idx): idx for idx in batch_indices}
-                
-                for future in tqdm(
-                    concurrent.futures.as_completed(future_to_idx),
-                    total=len(batch_indices),
-                    desc=f"Batch {batch_num} (threading)",
-                    unit="img"
-                ):
-                    iter_idx, single_image, positions_tensor, M, magnitude = future.result()
-                    batch_manager.add_image_to_batch(iter_idx, single_image, positions_tensor, M, g1[iter_idx], g2[iter_idx])
-                    
-                    if aggressive_gc and iter_idx % 5 == 0:
-                        import gc
-                        gc.collect()
-        
         # Save current batch to disk and clear from memory
-        batch_save_success = batch_manager.save_current_batch_to_disk_improved(config['save_psf_param'])
+        batch_save_success = save_batch_to_disk(batch_manager, config['save_psf_param'])
         
         if batch_save_success:
             successful_batches += 1
-            print(f"✅ Batch {batch_num} saved successfully")
+            print(f"Batch {batch_num} saved successfully")
         else:
-            print(f"❌ Batch {batch_num} save failed")
+            print(f"Batch {batch_num} save failed")
             break
         
         # Force garbage collection after each batch
         if aggressive_gc:
-            import gc
-            gc.collect()
+            cleanup_memory(aggressive=True)
         
         if monitor_memory:
-            print(f"💾 Memory after batch: {get_memory_status()}")
+            print(f"Memory after batch: {get_memory_status()}")
     
-    # Final summary - NO COMBINATION
+    # Final summary 
     print(f"\n=== BATCH GENERATION COMPLETED ===")
-    print(f"✅ Successfully generated: {successful_batches}/{total_batches} batches")
-    print(f"📁 Batch files location: {save_folder}")
-    print(f"📋 Batch files pattern: batch_X_images.pt, batch_X_catalog.pt")
-    
+    print(f"Successfully generated: {successful_batches}/{total_batches} batches")
+    print(f"Batch files location: {save_folder}")
+    print(f"Batch files pattern: batch_X_images.pt, batch_X_catalog.pt")
     
     return {
         'successful_batches': successful_batches,
@@ -1205,59 +833,6 @@ def Generate_img_catalog_batched_streaming_fixed(config, use_multiprocessing=Fal
         'save_folder': save_folder,
         'setting': config['setting']
     }
-
-def plot_magnitude_distribution(magnitudes, num_selected, config):
-    if num_selected > config['num_data']:
-        print(f"selected number of galaxies is greater than generated number of galaxies, setting num_selected to {config['num_data']}")
-        num_selected = config['num_data']
-
-    mag = magnitudes[:num_selected]
-    mag_combined = np.concatenate(mag)
-    plt.hist(mag_combined, bins=100)
-    plt.xlabel("i-band ab magnitude")
-    plt.ylabel("Count")
-    plt.savefig(f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/notebooks/magnitude_distribution.png")
-
-def load_tiled_tensor_data(setting, data_folder="/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output"):
-    """
-    NEW FUNCTION: Load the tiled tensor data
-    
-    Returns:
-        images: torch.Tensor of shape [num_images, channels, height, width]
-        catalog: dict with tiled structure
-    """
-    save_folder = f"{data_folder}/{setting}"
-    image_file = f"{save_folder}/images_{setting}.pt"
-    catalog_file = f"{save_folder}/catalog_{setting}.pt"
-    
-    print(f"Loading tiled images from: {image_file}")
-    print(f"Loading tiled catalog from: {catalog_file}")
-    
-    # Load tensors
-    images = torch.load(image_file, weights_only=True, map_location='cpu')
-    catalog = torch.load(catalog_file, weights_only=True, map_location='cpu')
-    
-    print(f"✅ Loaded successfully!")
-    print(f"Images shape: {images.shape}")
-    print(f"Catalog structure:")
-    for key, tensor in catalog.items():
-        print(f"  {key}: {tensor.shape}")
-    
-    # Verify tiled structure
-    n_images = catalog['n_sources'].shape[0]
-    n_tiles_per_side = catalog['n_sources'].shape[1]
-    total_tiles = n_tiles_per_side ** 2
-    
-    print(f"Number of images: {n_images}")
-    print(f"Tiles per side: {n_tiles_per_side}")
-    print(f"Total tiles per image: {total_tiles}")
-    
-    # Show some statistics
-    total_sources_per_image = catalog['n_sources'].sum(dim=(1, 2))
-    print(f"Sources per image - mean: {total_sources_per_image.float().mean():.1f}, "
-          f"std: {total_sources_per_image.float().std():.1f}")
-    
-    return images, catalog
 
 def main():
     start_time = time.time()
@@ -1268,37 +843,21 @@ def main():
     print(f"=" * 50)
     with open('sim_config.yaml', 'r') as f:
         config = yaml.safe_load(f)
-
-    # Add resume capability options
-    resume_mode = config.get('resume_mode', True)  # Default to True for resumable generation
-    start_from = config.get('start_from', 0)  # Only used if resume_mode=False
     
-    # Add option to control multiprocessing and threading
     use_multiprocessing = config.get('use_multiprocessing', False)  # Default to False due to serialization issues
-    use_threading = config.get('use_threading', True)  # Default to True as it's more stable
     n_workers = config.get('n_workers', None)
     
     processing_mode = "Sequential"
     if use_multiprocessing:
         processing_mode = "Multiprocessing"
-    elif use_threading:
-        processing_mode = "Threading"
     
     print(f"Processing mode: {processing_mode}")
-    print(f"Resume mode: {'Enabled' if resume_mode else 'Disabled'}")
-    print(f"Large tensor accumulation: ENABLED")
-    if not resume_mode and start_from > 0:
-        print(f"Starting from index: {start_from}")
-    
     stop_on_multiprocessing_fail = config.get('stop_on_multiprocessing_fail', True)
 
     magnitudes = Generate_img_catalog_batched_streaming_fixed(
         config, 
         use_multiprocessing=use_multiprocessing, 
-        use_threading=use_threading, 
         n_workers=n_workers,
-        resume_mode=resume_mode, 
-        start_from=start_from,
         stop_on_multiprocessing_fail=stop_on_multiprocessing_fail 
     )
     
