@@ -109,3 +109,7 @@ outputs
 
 # image directories
 notebooks/catsim
+
+# additional directories to ignore
+**/figures
+**/catsim
