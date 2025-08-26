@@ -19,6 +19,7 @@ from datetime import datetime
 import concurrent.futures
 import tempfile
 import shutil
+import galsim 
 
 os.environ['CATSIM_DIR'] = '/scratch/regier_root/regier0/taodingr/descwl-shear-sims/catsim' 
 save_folder = f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output"
@@ -140,8 +141,27 @@ def clear_batch_memory(batch_manager):
     cleanup_memory(aggressive=True)
     print(f"Batch {batch_manager.current_batch_num} cleared from memory")
 
-def get_psf_param(psf_obj):
-    # Create a grid of pixel positions
+def get_psf_param(psf_obj, return_image=True, psf_size=64, center_pos=None):
+    """
+    Extract PSF parameters AND the PSF image array from PowerSpectrumPSF
+    
+    Parameters:
+    -----------
+    psf_obj : PowerSpectrumPSF
+        The PSF object from your simulation
+    return_image : bool
+        Whether to include the actual PSF image array
+    psf_size : int
+        Size of the PSF image to generate (psf_size x psf_size)
+    center_pos : tuple or None
+        Position to evaluate PSF at. If None, uses image center.
+    """
+    
+    # Use image center if no position specified
+    if center_pos is None:
+        center_pos = (psf_obj._im_cen, psf_obj._im_cen)
+    
+    # Create a grid of pixel positions around the center
     x_pixels = np.arange(psf_obj._tot_width)
     y_pixels = np.arange(psf_obj._tot_width)
     X, Y = np.meshgrid(x_pixels, y_pixels)
@@ -150,27 +170,45 @@ def get_psf_param(psf_obj):
     X_coord = (X - psf_obj._im_cen) * psf_obj._scale
     Y_coord = (Y - psf_obj._im_cen) * psf_obj._scale
 
-    # Sample the lookup tables
+    # Sample the lookup tables using the internal method
     g1_sampled, g2_sampled, mu_sampled = psf_obj._get_lensing((X_coord, Y_coord))
 
     # Calculate statistics and convert to Python natives
-    g1_mean = float(np.mean(g1_sampled))  
-    g1_var = float(np.var(g1_sampled))
-    g2_mean = float(np.mean(g2_sampled))
-    g2_var = float(np.var(g2_sampled))
-    mu_mean = float(np.mean(mu_sampled))
-    mu_var = float(np.var(mu_sampled))
-
-    dict = {
-        'g1_mean': g1_mean,
-        'g1_var': g1_var,
-        'g2_mean': g2_mean,
-        'g2_var': g2_var,
-        'mu_mean': mu_mean,
-        'mu_var': mu_var,  
-        }
-
-    return dict
+    psf_stats = {
+        'g1_mean': float(np.mean(g1_sampled)),
+        'g1_var': float(np.var(g1_sampled)),
+        'g2_mean': float(np.mean(g2_sampled)),
+        'g2_var': float(np.var(g2_sampled)),
+        'mu_mean': float(np.mean(mu_sampled)),
+        'mu_var': float(np.var(mu_sampled)),
+    }
+    
+    # NEW: Extract the actual PSF image if requested
+    if return_image:
+        # Get PSF at the specified position using the getPSF method
+        galsim_pos = galsim.PositionD(center_pos[0], center_pos[1])
+        psf_galsim_obj = psf_obj.getPSF(galsim_pos)
+        
+        # Draw the PSF image
+        psf_image = psf_galsim_obj.drawImage(
+            nx=psf_size, 
+            ny=psf_size,
+            scale=psf_obj._scale,  # Use the PSF's pixel scale
+            method='auto'
+        ).array
+        
+        # Normalize PSF to sum to 1 (required for AnaCal)
+        psf_image = psf_image / np.sum(psf_image)
+        
+        # Store as float32 to save memory
+        psf_stats['psf_image'] = psf_image.astype(np.float32)
+        
+        # Also store PSF metadata for debugging
+        psf_stats['psf_size'] = psf_size
+        psf_stats['psf_scale'] = psf_obj._scale
+        psf_stats['psf_center_pos'] = center_pos
+    
+    return psf_stats
 
 def create_psf_for_worker(config, se_dim, rng_seed):
     worker_rng = np.random.RandomState(rng_seed)
@@ -194,7 +232,12 @@ def process_single_image(args):
     # Create PSF inside the worker process (CRITICAL FIX)
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
     psf = create_psf_for_worker(config, se_dim, config['seed'] + iter_idx)
-    psf_param = get_psf_param(psf)
+    psf_param = get_psf_param(
+        psf, 
+        return_image=True, 
+        psf_size=64,  # Adjust size as needed
+        center_pos=None  # Use image center
+    )
 
     
     each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
