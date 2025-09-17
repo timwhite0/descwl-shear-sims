@@ -232,10 +232,11 @@ def process_single_image(args):
     # Create PSF inside the worker process (CRITICAL FIX)
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
     psf = create_psf_for_worker(config, se_dim, config['seed'] + iter_idx)
+    psf_size = config.get('psf_size', 64)
     psf_param = get_psf_param(
         psf, 
         return_image=True, 
-        psf_size=64,  # Adjust size as needed
+        psf_size=psf_size,  # Adjust size as needed
         center_pos=None  # Use image center
     )
 

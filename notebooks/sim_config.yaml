@@ -5,17 +5,18 @@ stop_on_multiprocessing_fail: true
 # Memory management settings
 memory_management:
   monitor_memory: false
-  batch_size: 10
+  batch_size: 100
   aggressive_gc: true
 
 # Data generation settings  
-num_data: 10        # number of images to generate
-seed: 11
+num_data: 100        # number of images to generate
+seed: 1234
 
 # VARIABLE PSF setting
 variable_psf: true
 variation_factor: 1.0
 save_psf_param: true
+psf_size: 256
 
 # FIXED PSF setting
 psf_type: "moffat"          # "moffat" or "gauss"
@@ -38,9 +39,9 @@ cosmic_rays: true
 bad_columns: true       
 shear_setting: vary       # vary or const
 
-density: 240                 # GALAXY density: per square arcmin, 80 is default  
+density: 80                 # GALAXY density: per square arcmin, 80 is default  
 
-setting: test
+setting: WLD_80_star_max_100_2000_with_filter_psf_256
 
 catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'   
 select_observable: 'i_ab'   # column name in the WLDEBlend catalog
@@ -57,7 +58,7 @@ star_config:
   # density: 10 
 
 star_setting:
-  star_filter: false
+  star_filter: true
   star_filter_mag: 18.0
   star_filter_band: 'r'
 
