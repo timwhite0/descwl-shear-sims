@@ -143,70 +143,94 @@ def clear_batch_memory(batch_manager):
 
 def get_psf_param(psf_obj, return_image=True, psf_size=64, center_pos=None):
     """
-    Extract PSF parameters AND the PSF image array from PowerSpectrumPSF
+    Extract PSF parameters AND the PSF image array from different PSF types
     
     Parameters:
     -----------
-    psf_obj : PowerSpectrumPSF
-        The PSF object from your simulation
+    psf_obj : PSF object
+        The PSF object from your simulation (variable PSF, Gaussian, or Moffat)
     return_image : bool
         Whether to include the actual PSF image array
     psf_size : int
-        Size of the PSF image to generate (psf_size x psf_size)
+        Size of the PSF image to generate (psf_size x psf_size) - used for fixed PSFs
     center_pos : tuple or None
-        Position to evaluate PSF at. If None, uses image center.
+        Position to evaluate PSF at. If None, uses appropriate center.
     """
     
-    # Use image center if no position specified
-    if center_pos is None:
-        center_pos = (psf_obj._im_cen, psf_obj._im_cen)
+    if hasattr(psf_obj, '_im_cen') and hasattr(psf_obj, '_tot_width'):
+        # Variable PSF 
+        if center_pos is None:
+            center_pos = (psf_obj._im_cen, psf_obj._im_cen)
+        
+        x_pixels = np.arange(psf_obj._tot_width)
+        y_pixels = np.arange(psf_obj._tot_width)
+        X, Y = np.meshgrid(x_pixels, y_pixels)
+
+        X_coord = (X - psf_obj._im_cen) * psf_obj._scale
+        Y_coord = (Y - psf_obj._im_cen) * psf_obj._scale
+
+        g1_sampled, g2_sampled, mu_sampled = psf_obj._get_lensing((X_coord, Y_coord))
+
+        psf_stats = {
+            'g1_mean': float(np.mean(g1_sampled)),
+            'g1_var': float(np.var(g1_sampled)),
+            'g2_mean': float(np.mean(g2_sampled)),
+            'g2_var': float(np.var(g2_sampled)),
+            'mu_mean': float(np.mean(mu_sampled)),
+            'mu_var': float(np.var(mu_sampled)),
+            'psf_type': 'variable'
+        }
+        
+        if return_image:
+            galsim_pos = galsim.PositionD(center_pos[0], center_pos[1])
+            psf_galsim_obj = psf_obj.getPSF(galsim_pos)
+            
+            psf_image = psf_galsim_obj.drawImage(
+                nx=psf_size, 
+                ny=psf_size,
+                scale=psf_obj._scale,  
+                method='auto'
+            ).array
+            
+            psf_image = psf_image / np.sum(psf_image)
+            psf_stats['psf_image'] = psf_image.astype(np.float32)
+            psf_stats['psf_scale'] = psf_obj._scale
+        
+    else:
+        # Fixed PSF 
+        if center_pos is None:
+            center_pos = (psf_size / 2.0, psf_size / 2.0)
+        
+        psf_stats = {
+            'g1_mean': 0.0,
+            'g1_var': 0.0,
+            'g2_mean': 0.0,
+            'g2_var': 0.0,
+            'mu_mean': 1.0,  
+            'mu_var': 0.0,
+            'psf_type': 'fixed'
+        }
+        
+        if return_image:
+            pixel_scale = 0.2
+            
+            psf_image = psf_obj.drawImage(
+                nx=psf_size, 
+                ny=psf_size,
+                scale=pixel_scale,
+                method='auto'
+            ).array
+            
+            # Normalize PSF to sum to 1
+            psf_image = psf_image / np.sum(psf_image)
+            psf_stats['psf_image'] = psf_image.astype(np.float32)
+            psf_stats['psf_scale'] = pixel_scale
     
-    # Create a grid of pixel positions around the center
-    x_pixels = np.arange(psf_obj._tot_width)
-    y_pixels = np.arange(psf_obj._tot_width)
-    X, Y = np.meshgrid(x_pixels, y_pixels)
-
-    # Convert to the coordinate system used by the lookup tables
-    X_coord = (X - psf_obj._im_cen) * psf_obj._scale
-    Y_coord = (Y - psf_obj._im_cen) * psf_obj._scale
-
-    # Sample the lookup tables using the internal method
-    g1_sampled, g2_sampled, mu_sampled = psf_obj._get_lensing((X_coord, Y_coord))
-
-    # Calculate statistics and convert to Python natives
-    psf_stats = {
-        'g1_mean': float(np.mean(g1_sampled)),
-        'g1_var': float(np.var(g1_sampled)),
-        'g2_mean': float(np.mean(g2_sampled)),
-        'g2_var': float(np.var(g2_sampled)),
-        'mu_mean': float(np.mean(mu_sampled)),
-        'mu_var': float(np.var(mu_sampled)),
-    }
-    
-    # NEW: Extract the actual PSF image if requested
     if return_image:
-        # Get PSF at the specified position using the getPSF method
-        galsim_pos = galsim.PositionD(center_pos[0], center_pos[1])
-        psf_galsim_obj = psf_obj.getPSF(galsim_pos)
-        
-        # Draw the PSF image
-        psf_image = psf_galsim_obj.drawImage(
-            nx=psf_size, 
-            ny=psf_size,
-            scale=psf_obj._scale,  # Use the PSF's pixel scale
-            method='auto'
-        ).array
-        
-        # Normalize PSF to sum to 1 (required for AnaCal)
-        psf_image = psf_image / np.sum(psf_image)
-        
-        # Store as float32 to save memory
-        psf_stats['psf_image'] = psf_image.astype(np.float32)
-        
-        # Also store PSF metadata for debugging
-        psf_stats['psf_size'] = psf_size
-        psf_stats['psf_scale'] = psf_obj._scale
-        psf_stats['psf_center_pos'] = center_pos
+        psf_stats.update({
+            'psf_size': psf_size,
+            'psf_center_pos': center_pos
+        })
     
     return psf_stats
 
