@@ -218,18 +218,17 @@ def anacal_estimate(image, psf, catalog, npix):
 
     mag_zero = 30.0
     pixel_scale = 0.2
-    noise_variance = 0.354 #0.23**2.0
+    noise_variance = 0.354 # https://github.com/mr-superonion/xlens/blob/718794c0450565aec9c4f0e9d9082283e9fef5b6/xlens/simulator/multiband_defaults.py#L38
     noise_array = torch.normal(mean = torch.zeros(2048, 2048), std = np.sqrt(noise_variance) * torch.ones(2048, 2048))
     detection = None
 
     band = 0
 
-    est_shear1 = torch.zeros(len(image))
-    est_shear2 = torch.zeros(len(image))
     e1_sum = np.zeros(len(image))
     e2_sum = np.zeros(len(image))
     e1g1_sum = np.zeros(len(image))
     e2g2_sum = np.zeros(len(image))
+    num_detections = np.zeros(len(image))
 
     for i in range(len(image)):
         gal_array = image[i,band]
@@ -251,18 +250,20 @@ def anacal_estimate(image, psf, catalog, npix):
         e1_sum[i] = np.sum(e1)
         e1g1_sum[i] = np.sum(e1g1)
 
+        num_detections[i] = len(e1)
+
         e2 = out["fpfs_w"] * out["fpfs_e2"]
         e2g2 = out["fpfs_dw_dg2"] * out["fpfs_e2"] + out["fpfs_w"] * out["fpfs_de2_dg2"]
         e2_sum[i] = np.sum(e2)
         e2g2_sum[i] = np.sum(e2g2)
 
-    R1 = np.sum(e1g1_sum) / len(image)
-    R2 = np.sum(e2g2_sum) / len(image)
+    e1_avg = e1_sum / num_detections
+    e2_avg = e2_sum / num_detections
+    R1 = np.sum(e1g1_sum) / np.sum(num_detections)
+    R2 = np.sum(e2g2_sum) / np.sum(num_detections)
 
-    for i in range(len(image)):
-        est_shear1[i] = e1_sum[i] / R1
-        est_shear2[i] = e2_sum[i] / R2
-        
+    est_shear1 = e1_avg / R1
+    est_shear2 = e2_avg / R2
 
     return est_shear1, est_shear2, true_shear1, true_shear2
 
