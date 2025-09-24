@@ -10,7 +10,7 @@ from descwl_shear_sims.layout.layout import Layout
 
 import anacal
 
-os.environ['CATSIM_DIR'] = 'catsim' 
+os.environ['CATSIM_DIR'] = 'notebooks/catsim' 
 
 def get_psf_param(psf_obj, pixel_scale, psf_size):
     center_pos = (psf_size / 2.0, psf_size / 2.0)
@@ -102,10 +102,6 @@ def generate_many_images_and_catalogs(
         psf_type, psf_fwhm, bands, noise_factor, dither, dither_size, rotate,
         cosmic_rays, bad_columns, psf_size,
     ):
-    
-    print(f"Generating {num_images} images sequentially...")
-    print(f"Bands: {bands}")
-    print(f"Galaxy density: {density}")
 
     # Setup
     rng = np.random.RandomState(seed)
@@ -132,7 +128,7 @@ def generate_many_images_and_catalogs(
     psf_params = []
     
     # Generate images
-    for i in tqdm(range(num_images), desc="Generating images"):
+    for i in range(num_images):
         image_tensor, positions_tensor, M, magnitude = generate_one_image_and_catalog(
             rng=rng, psf=psf, layout=layout, shifts=shifts, 
             g1=g1[i], g2=g2[i],
@@ -160,8 +156,6 @@ def generate_many_images_and_catalogs(
         
         psf_param = get_psf_param(psf, pixel_scale=pixel_scale, psf_size=psf_size)
         psf_params.append(psf_param)
-    
-    print(f"Generated {num_images} images successfully")
     
     return images_tensor, catalogs, psf_params
 
@@ -192,6 +186,7 @@ catalog_type = 'wldeblend'   # 'wldeblend' or 'fixed'
 select_observable = 'i_ab'   # column name in the WLDEBlend catalog
 select_lower_limit = None
 select_upper_limit = 27
+save_dir = 'Anacal_results_density80'
 
 def convert_for_anacal(catalogs, psf_params):    
     g1_values = torch.tensor([cat['g1'] for cat in catalogs], dtype=torch.float32)
@@ -223,14 +218,18 @@ def anacal_estimate(image, psf, catalog, npix):
 
     mag_zero = 30.0
     pixel_scale = 0.2
-    noise_variance = 0.23**2.0
-    noise_array = None
+    noise_variance = 0.354 #0.23**2.0
+    noise_array = torch.normal(mean = torch.zeros(2048, 2048), std = np.sqrt(noise_variance) * torch.ones(2048, 2048))
     detection = None
 
     band = 0
 
     est_shear1 = torch.zeros(len(image))
     est_shear2 = torch.zeros(len(image))
+    e1_sum = np.zeros(len(image))
+    e2_sum = np.zeros(len(image))
+    e1g1_sum = np.zeros(len(image))
+    e2g2_sum = np.zeros(len(image))
 
     for i in range(len(image)):
         gal_array = image[i,band]
@@ -249,13 +248,21 @@ def anacal_estimate(image, psf, catalog, npix):
 
         e1 = out["fpfs_w"] * out["fpfs_e1"]
         e1g1 = out["fpfs_dw_dg1"] * out["fpfs_e1"] + out["fpfs_w"] * out["fpfs_de1_dg1"]
-
-        est_shear1[i] = np.sum(e1) / np.sum(e1g1)
+        e1_sum[i] = np.sum(e1)
+        e1g1_sum[i] = np.sum(e1g1)
 
         e2 = out["fpfs_w"] * out["fpfs_e2"]
         e2g2 = out["fpfs_dw_dg2"] * out["fpfs_e2"] + out["fpfs_w"] * out["fpfs_de2_dg2"]
+        e2_sum[i] = np.sum(e2)
+        e2g2_sum[i] = np.sum(e2g2)
+
+    R1 = np.sum(e1g1_sum) / len(image)
+    R2 = np.sum(e2g2_sum) / len(image)
+
+    for i in range(len(image)):
+        est_shear1[i] = e1_sum[i] / R1
+        est_shear2[i] = e2_sum[i] / R2
         
-        est_shear2[i] = np.sum(e2) / np.sum(e2g2)
 
     return est_shear1, est_shear2, true_shear1, true_shear2
 
@@ -268,7 +275,11 @@ images = []
 catalogs = []
 psf_params = []
 
-for j in range(num_images):
+print(f"Starting generation of {num_images} images...")
+print(f"Bands: {bands}")
+print(f"Galaxy density: {density}")
+
+for j in tqdm(range(num_images), desc="Processing images"):
     im, cat, psfp = generate_many_images_and_catalogs(
         num_images=1, seed=seed + j, layout_name=layout_name, coadd_dim=coadd_dim, buff=buff, pixel_scale=pixel_scale, density=density,
         select_observable=select_observable, select_lower_limit=select_lower_limit, select_upper_limit=select_upper_limit,
@@ -279,9 +290,9 @@ for j in range(num_images):
     catalogs.append(cat)
     psf_params.append(psfp)
 
-    torch.save(images, f'anacal_results_density80/images.pt')
-    torch.save(catalogs, f'anacal_results_density80/catalogs.pt')
-    torch.save(psf_params, f'anacal_results_density80/psf_params.pt') 
+    torch.save(images, f'{save_dir}/images.pt')
+    torch.save(catalogs, f'{save_dir}/catalogs.pt')
+    torch.save(psf_params, f'{save_dir}/psf_params.pt') 
 
     es1, es2, ts1, ts2 = anacal_estimate(im, psfp, cat, 64)
     est_shear1[j] = es1
@@ -289,7 +300,12 @@ for j in range(num_images):
     true_shear1[j] = ts1
     true_shear2[j] = ts2
 
-    torch.save(est_shear1, 'anacal_results_density80/est_shear1.pt')
-    torch.save(est_shear2, 'anacal_results_density80/est_shear2.pt')
-    torch.save(true_shear1, 'anacal_results_density80/true_shear1.pt')
-    torch.save(true_shear2, 'anacal_results_density80/true_shear2.pt')
+    torch.save(est_shear1, f'{save_dir}/est_shear1.pt')
+    torch.save(est_shear2, f'{save_dir}/est_shear2.pt')
+    torch.save(true_shear1, f'{save_dir}/true_shear1.pt')
+    torch.save(true_shear2, f'{save_dir}/true_shear2.pt')
+
+print("All images processed successfully!")
+
+
+
