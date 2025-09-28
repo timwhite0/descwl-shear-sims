@@ -903,7 +903,7 @@ def plot_magnitude_distribution(magnitudes, num_selected, config):
     plt.hist(mag_combined, bins=100)
     plt.xlabel("i-band ab magnitude")
     plt.ylabel("Count")
-    plt.savefig(f"/data/scratch/taodingr/lsst_stack/descwl-shear-sims/notebooks/magnitude_distribution.png")
+    plt.savefig(f"/data/scratch/taodingr/lsst_stack/descwl-shear-sims/image_generation/magnitude_distribution.png")
 
 def load_large_tensor_data(setting, data_folder="/data/scratch/taodingr/weak_lensing/descwl"):
     """
