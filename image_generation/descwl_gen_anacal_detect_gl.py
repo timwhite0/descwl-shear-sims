@@ -20,6 +20,7 @@ import concurrent.futures
 import tempfile
 import shutil
 import galsim 
+import anacal 
 
 os.environ['CATSIM_DIR'] = '/scratch/regier_root/regier0/taodingr/descwl-shear-sims/catsim' 
 save_folder = f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output"
@@ -86,7 +87,7 @@ def safe_save_tensor(tensor, filepath, max_retries=3):
     print(f"All save attempts failed for {filepath}")
     return False
 
-def save_batch_to_disk(batch_manager, save_psf_images=True):
+def save_batch_to_disk(batch_manager, save_anacal=True):
     if batch_manager.current_batch_images is None:
         print("No batch to save!")
         return False
@@ -95,16 +96,16 @@ def save_batch_to_disk(batch_manager, save_psf_images=True):
     
     batch_image_file = f"{batch_manager.save_folder}/batch_{batch_manager.current_batch_num}_images.pt"
     batch_catalog_file = f"{batch_manager.save_folder}/batch_{batch_manager.current_batch_num}_catalog.pt"
-    batch_psf_file = f"{batch_manager.save_folder}/batch_{batch_manager.current_batch_num}_psf_images.pt"
+    batch_anacal_file = f"{batch_manager.save_folder}/batch_{batch_manager.current_batch_num}_anacal.pt"
     
     image_success = safe_save_tensor(batch_manager.current_batch_images, batch_image_file)
     catalog_success = safe_save_tensor(batch_manager.current_batch_catalog, batch_catalog_file)
     
-    psf_success = True
-    if save_psf_images and batch_manager.current_batch_psf_images:
-        psf_success = safe_save_tensor(batch_manager.current_batch_psf_images, batch_psf_file)
+    anacal_success = True
+    if save_anacal and batch_manager.current_batch_anacal:
+        anacal_success = safe_save_tensor(batch_manager.current_batch_anacal, batch_anacal_file)
     
-    overall_success = image_success and catalog_success and psf_success
+    overall_success = image_success and catalog_success and anacal_success
     
     if image_success or catalog_success:
         batch_info = {
@@ -112,7 +113,7 @@ def save_batch_to_disk(batch_manager, save_psf_images=True):
             'batch_size': batch_manager.current_batch_size,
             'image_file': batch_image_file if image_success else None,
             'catalog_file': batch_catalog_file if catalog_success else None,
-            'psf_file': batch_psf_file if psf_success else None,
+            'anacal_file': batch_anacal_file if anacal_success else None,
             'image_shape': batch_manager.current_batch_images.shape if image_success else None,
             'catalog_shape': batch_manager.current_batch_catalog["locs"].shape if catalog_success else None,
         }
@@ -121,7 +122,7 @@ def save_batch_to_disk(batch_manager, save_psf_images=True):
     if overall_success:
         print(f"Batch {batch_manager.current_batch_num} saved successfully")
     else:
-        print(f"Partial save - Images: {image_success}, Catalog: {catalog_success}, PSF: {psf_success}")
+        print(f"Partial save - Images: {image_success}, Catalog: {catalog_success}, Anacal: {anacal_success}")
     
     print(f"Progress: {batch_manager.total_processed}/{batch_manager.total_images} images")
     
@@ -132,27 +133,69 @@ def clear_batch_memory(batch_manager):
     if batch_manager.current_batch_images is not None:
         del batch_manager.current_batch_images
         del batch_manager.current_batch_catalog
-        del batch_manager.current_batch_psf_images
+        del batch_manager.current_batch_anacal
         
         batch_manager.current_batch_images = None
         batch_manager.current_batch_catalog = None
-        batch_manager.current_batch_psf_images = None
+        batch_manager.current_batch_anacal = None
     
     cleanup_memory(aggressive=True)
     print(f"Batch {batch_manager.current_batch_num} cleared from memory")
 
-def get_psf_image(psf_obj, psf_size=64, center_pos=None):
+def anacal_single_image(image, catalog, g1, g2, psf_image, npix=64, sigma_arcsec=0.52, mag_zero=30.0, pixel_scale=0.2, noise_variance=0.354, band=0):
     """
-    Extract only the PSF image array from different PSF types
+    Process a single image with anacal and return detection statistics
+    """
+    fpfs_config = anacal.fpfs.FpfsConfig(
+        npix=npix,
+        sigma_arcsec=sigma_arcsec,
+    )
+
+    gal_array = image[band].numpy()  # Convert to numpy if tensor
+    psf_array = psf_image
+    
+    # Generate noise array
+    noise_array = torch.normal(mean = torch.zeros(2048, 2048), std = np.sqrt(noise_variance) * torch.ones(2048, 2048))
+
+    out = anacal.fpfs.process_image(
+        fpfs_config=fpfs_config,
+        mag_zero=mag_zero,
+        gal_array=gal_array,
+        psf_array=psf_array,
+        pixel_scale=pixel_scale,
+        noise_variance=noise_variance,
+        noise_array=noise_array,
+        detection=None,
+    )
+
+    e1 = out["fpfs_w"] * out["fpfs_e1"]
+    e1g1 = out["fpfs_dw_dg1"] * out["fpfs_e1"] + out["fpfs_w"] * out["fpfs_de1_dg1"]
+    e1_sum = np.sum(e1)
+    e1g1_sum = np.sum(e1g1)
+
+    e2 = out["fpfs_w"] * out["fpfs_e2"]
+    e2g2 = out["fpfs_dw_dg2"] * out["fpfs_e2"] + out["fpfs_w"] * out["fpfs_de2_dg2"]
+    e2_sum = np.sum(e2)
+    e2g2_sum = np.sum(e2g2)
+
+    num_detections = len(e1)
+
+    return e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections
+
+def get_psf_image(psf_obj, psf_size=64, pixel_scale=0.2, center_pos=None):
+    """
+    Extract PSF image array consistent with first code's approach
     
     Parameters:
     -----------
     psf_obj : PSF object
-        The PSF object from your simulation (variable PSF, Gaussian, or Moffat)
+        The PSF object from your simulation
     psf_size : int
-        Size of the PSF image to generate (psf_size x psf_size)
+        Size of the PSF image (psf_size x psf_size)
+    pixel_scale : float
+        Pixel scale for drawing the PSF
     center_pos : tuple or None
-        Position to evaluate PSF at. If None, uses appropriate center.
+        Position to evaluate PSF at (not used for fixed PSF)
     """
     
     if hasattr(psf_obj, '_im_cen') and hasattr(psf_obj, '_tot_width'):
@@ -170,23 +213,17 @@ def get_psf_image(psf_obj, psf_size=64, center_pos=None):
             method='auto'
         ).array
         
-        psf_image = psf_image / np.sum(psf_image)
-        return psf_image.astype(np.float32)
-        
     else:
-        # Fixed PSF 
-        pixel_scale = 0.2
-        
+        # Fixed PSF - match first code's approach exactly
         psf_image = psf_obj.drawImage(
-            nx=psf_size, 
-            ny=psf_size,
             scale=pixel_scale,
-            method='auto'
+            nx=psf_size, 
+            ny=psf_size
         ).array
-        
-        # Normalize PSF to sum to 1
-        psf_image = psf_image / np.sum(psf_image)
-        return psf_image.astype(np.float32)
+    
+    # Return without normalization to match first code
+    # Convert to float64 to match first code's final format
+    return psf_image.astype(np.float64)
 
 def create_psf_for_worker(config, se_dim, rng_seed):
     worker_rng = np.random.RandomState(rng_seed)
@@ -207,16 +244,13 @@ def process_single_image(args):
     for _ in range(iter_idx):
         rng.rand()
     
-    # Create PSF inside the worker process (CRITICAL FIX)
+    # Create PSF inside the worker process
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
     psf = create_psf_for_worker(config, se_dim, config['seed'] + iter_idx)
-    psf_size = config.get('psf_size', 64)
-    psf_image = get_psf_image(
-        psf, 
-        psf_size=psf_size,
-        center_pos=None  # Use image center
-    )
 
+    # Extract PSF image for anacal
+    psf_size = config.get('psf_size', 64)  # Make PSF size configurable
+    psf_image = get_psf_image(psf, psf_size=psf_size)
     
     each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
         rng, config['mag'], config['hlr'], psf, config['morph'], 
@@ -266,7 +300,9 @@ class StreamingBatchTensorManager:
         self.current_batch_catalog = None
         self.current_batch_num = 0
         self.current_batch_size = 0
-        self.current_batch_psf_images = None
+        
+        # Anacal results storage
+        self.current_batch_anacal = None
         
         # Track completed batches 
         self.completed_batches = []
@@ -281,6 +317,15 @@ class StreamingBatchTensorManager:
         print(f"  Tiles per side: {self.n_tiles_per_side}")
         print(f"  Tile size: {self.tile_size}x{self.tile_size} pixels")
         print(f"  Total tiles per image: {self.n_tiles_per_side * self.n_tiles_per_side}")
+        
+        # Initialize anacal results tensors
+        self.anacal_results = {
+            'e1_sum': torch.zeros(self.total_images),
+            'e1g1_sum': torch.zeros(self.total_images),
+            'e2_sum': torch.zeros(self.total_images),
+            'e2g2_sum': torch.zeros(self.total_images),
+            'num_detections': torch.zeros(self.total_images)
+        }
 
     def start_new_batch(self, batch_start_idx):
         """Start a new batch and clear previous batch from memory"""
@@ -369,11 +414,20 @@ class StreamingBatchTensorManager:
                                  dtype=torch.float32),
         }
 
-        # Initialize PSF images dictionary (only images, no stats)
-        self.current_batch_psf_images = {}
+        # Initialize anacal batch tensors
+        self.current_batch_anacal = {
+            'e1_sum': torch.zeros(self.current_batch_size),
+            'e1g1_sum': torch.zeros(self.current_batch_size),
+            'e2_sum': torch.zeros(self.current_batch_size),
+            'e2g2_sum': torch.zeros(self.current_batch_size),
+            'num_detections': torch.zeros(self.current_batch_size)
+        }
 
-    def add_image_to_batch(self, global_idx, image, positions, n_sources, g1, g2, psf_image=None):
-        """Add a single image to the current batch with TILED catalog structure"""
+        # Initialize PSF images dictionary (removed - not needed for anacal-only version)
+        pass
+
+    def add_image_to_batch(self, global_idx, image, positions, n_sources, g1, g2, psf_image):
+        """Add a single image to the current batch with TILED catalog structure and anacal processing"""
         # Calculate local index within current batch
         batch_start_idx = (self.current_batch_num - 1) * self.batch_size
         local_idx = global_idx - batch_start_idx
@@ -414,9 +468,28 @@ class StreamingBatchTensorManager:
                 self.current_batch_catalog["shear_1"][local_idx, tile_row, tile_col, :n_tile_sources] = g1_tensor
                 self.current_batch_catalog["shear_2"][local_idx, tile_row, tile_col, :n_tile_sources] = g2_tensor
         
-        # Add PSF image (only the image array, no stats)
-        if psf_image is not None:
-            self.current_batch_psf_images[local_idx] = psf_image
+        # Process with anacal
+        try:
+            e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections = anacal_single_image(
+                image, positions, g1, g2, psf_image
+            )
+            
+            # Store anacal results
+            self.current_batch_anacal['e1_sum'][local_idx] = e1_sum
+            self.current_batch_anacal['e1g1_sum'][local_idx] = e1g1_sum
+            self.current_batch_anacal['e2_sum'][local_idx] = e2_sum
+            self.current_batch_anacal['e2g2_sum'][local_idx] = e2g2_sum
+            self.current_batch_anacal['num_detections'][local_idx] = num_detections
+            
+            # Store in global results
+            self.anacal_results['e1_sum'][global_idx] = e1_sum
+            self.anacal_results['e1g1_sum'][global_idx] = e1g1_sum
+            self.anacal_results['e2_sum'][global_idx] = e2_sum
+            self.anacal_results['e2g2_sum'][global_idx] = e2g2_sum
+            self.anacal_results['num_detections'][global_idx] = num_detections
+            
+        except Exception as e:
+            print(f"Anacal processing failed for image {global_idx}: {e}")
 
         self.total_processed += 1
 
@@ -791,7 +864,7 @@ def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=Non
             break
         
         # Save current batch to disk and clear from memory
-        batch_save_success = save_batch_to_disk(batch_manager, config.get('save_psf_images', True))
+        batch_save_success = save_batch_to_disk(batch_manager, save_anacal=True)
         
         if batch_save_success:
             successful_batches += 1
@@ -811,13 +884,20 @@ def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=Non
     print(f"\n=== BATCH GENERATION COMPLETED ===")
     print(f"Successfully generated: {successful_batches}/{total_batches} batches")
     print(f"Batch files location: {save_folder}")
-    print(f"Batch files pattern: batch_X_images.pt, batch_X_catalog.pt")
+    print(f"Batch files pattern: batch_X_images.pt, batch_X_catalog.pt, batch_X_anacal.pt")
+    
+    # Save final anacal results
+    if successful_batches > 0:
+        anacal_save_path = f"{save_folder}/anacal_results_final.pt"
+        print(f"Saving final anacal results to {anacal_save_path}")
+        safe_save_tensor(batch_manager.anacal_results, anacal_save_path)
     
     return {
         'successful_batches': successful_batches,
         'total_batches': total_batches,
         'save_folder': save_folder,
-        'setting': config['setting']
+        'setting': config['setting'],
+        'anacal_results': batch_manager.anacal_results
     }
 
 def main():
