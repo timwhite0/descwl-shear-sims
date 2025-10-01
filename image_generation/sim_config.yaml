@@ -13,7 +13,7 @@ num_data: 100       # number of images to generate
 seed: 1234
 
 # VARIABLE PSF setting
-variable_psf: false
+variable_psf: true
 variation_factor: 1.0
 save_psf_param: true
 psf_size: 64
@@ -41,7 +41,7 @@ shear_setting: vary       # vary or const
 
 density: 80                 # GALAXY density: per square arcmin, 80 is default  
 
-setting: test
+setting: test_vary_psf
 
 catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'   
 select_observable: 'i_ab'   # column name in the WLDEBlend catalog

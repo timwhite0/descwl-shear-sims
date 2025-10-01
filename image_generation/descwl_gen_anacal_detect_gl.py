@@ -142,31 +142,78 @@ def clear_batch_memory(batch_manager):
     cleanup_memory(aggressive=True)
     print(f"Batch {batch_manager.current_batch_num} cleared from memory")
 
-def anacal_single_image(image, catalog, g1, g2, psf_image, npix=64, sigma_arcsec=0.52, mag_zero=30.0, pixel_scale=0.2, noise_variance=0.354, band=0):
+class GalSimPsfWrapper(anacal.psf.BasePsf):
+    """Wrapper to make GalSim PSF objects compatible with anacal"""
+    
+    def __init__(self, galsim_psf, pixel_scale, npix=64, is_variable=False):
+        self.galsim_psf = galsim_psf
+        self.pixel_scale = pixel_scale
+        self.npix = npix
+        self.is_variable = is_variable
+        # ADD: Mock shape attribute so anacal thinks this is NOT a numpy array
+        self.shape = None  # This signals to anacal that it's not an array
+    
+    def draw(self, x, y):
+        """Draw PSF at position (x, y)"""
+        if self.is_variable:
+            # Variable PSF - get position-specific PSF
+            pos = galsim.PositionD(x, y)
+            psf_at_pos = self.galsim_psf.getPSF(pos)
+        else:
+            # Fixed PSF - same everywhere
+            psf_at_pos = self.galsim_psf
+        
+        return psf_at_pos.drawImage(
+            nx=self.npix,
+            ny=self.npix,
+            scale=self.pixel_scale,
+            method='auto'
+        ).array.astype(np.float64)
+
+def anacal_single_image(image, catalog, g1, g2, psf_input, npix=64, sigma_arcsec=0.52, 
+                        mag_zero=30.0, pixel_scale=0.2, noise_variance=0.354, band=0):
     """
-    Process a single image with anacal and return detection statistics
+    Process a single image with anacal
     """
     fpfs_config = anacal.fpfs.FpfsConfig(
         npix=npix,
         sigma_arcsec=sigma_arcsec,
     )
 
-    gal_array = image[band].numpy()  # Convert to numpy if tensor
-    psf_array = psf_image
-    
-    # Generate noise array
-    noise_array = torch.normal(mean = torch.zeros(2048, 2048), std = np.sqrt(noise_variance) * torch.ones(2048, 2048))
+    gal_array = image[band].numpy()  
+    noise_array = torch.normal(
+        mean=torch.zeros(2048, 2048), 
+        std=np.sqrt(noise_variance) * torch.ones(2048, 2048)
+    ).numpy()
 
-    out = anacal.fpfs.process_image(
-        fpfs_config=fpfs_config,
-        mag_zero=mag_zero,
-        gal_array=gal_array,
-        psf_array=psf_array,
-        pixel_scale=pixel_scale,
-        noise_variance=noise_variance,
-        noise_array=noise_array,
-        detection=None,
-    )
+    # Determine if psf_input is array or object
+    if isinstance(psf_input, np.ndarray):
+        # Fixed PSF case
+        out = anacal.fpfs.process_image(
+            fpfs_config=fpfs_config,
+            mag_zero=mag_zero,
+            gal_array=gal_array,
+            psf_array=psf_input,
+            pixel_scale=pixel_scale,
+            noise_variance=noise_variance,
+            noise_array=noise_array,
+            detection=None,
+        )
+    else:
+        # Variable PSF case - pass BasePsf object to psf_object
+        # For psf_array, draw PSF at image center as representative
+        center_psf = psf_input.draw(1024, 1024)  # Center of 2048x2048 image
+        out = anacal.fpfs.process_image(
+            fpfs_config=fpfs_config,
+            mag_zero=mag_zero,
+            gal_array=gal_array,
+            psf_array=center_psf,
+            psf_object=psf_input,
+            pixel_scale=pixel_scale,
+            noise_variance=noise_variance,
+            noise_array=noise_array,
+            detection=None,
+        )
 
     e1 = out["fpfs_w"] * out["fpfs_e1"]
     e1g1 = out["fpfs_dw_dg1"] * out["fpfs_e1"] + out["fpfs_w"] * out["fpfs_de1_dg1"]
@@ -236,8 +283,10 @@ def create_psf_for_worker(config, se_dim, rng_seed):
         elif config['psf_type'] == "moffat":  
             return make_fixed_psf(psf_type=config['psf_type'], psf_fwhm=0.8)
 
-def process_single_image(args):
-    (iter_idx, config, g1_val, g2_val, rng_state, psf_config, layout, shifts, star_config, generate_star, star_setting) = args
+def process_single_image_with_anacal(args):
+    """Generate image and run anacal in the same worker process"""
+    (iter_idx, config, g1_val, g2_val, rng_state, psf_config, layout, shifts, 
+     star_config, generate_star, star_setting) = args
     
     rng = np.random.RandomState()
     rng.set_state(rng_state)
@@ -247,30 +296,72 @@ def process_single_image(args):
     # Create PSF inside the worker process
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
     psf = create_psf_for_worker(config, se_dim, config['seed'] + iter_idx)
-
-    # Extract PSF image for anacal
-    psf_size = config.get('psf_size', 64)  # Make PSF size configurable
-    psf_image = get_psf_image(psf, psf_size=psf_size)
     
+    # Generate image
     each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
         rng, config['mag'], config['hlr'], psf, config['morph'], 
         config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
         config['sep'], g1_val, g2_val, config['bands'], config['noise_factor'], 
         config['dither'], config['dither_size'], config['rotate'], 
         config['cosmic_rays'], config['bad_columns'], config['star_bleeds'], 
-        star_config, generate_star, star_setting, shifts, config['catalog_type'], config['select_observable'],  
-        config['select_lower_limit'], config['select_upper_limit'], config['draw_bright']
+        star_config, generate_star, star_setting, shifts, config['catalog_type'], 
+        config['select_observable'], config['select_lower_limit'], 
+        config['select_upper_limit'], config['draw_bright']
     )
     
+    # Crop image
     crop_size = 2048
     h_center, w_center = each_image.shape[1] // 2, each_image.shape[2] // 2
     half_crop = crop_size // 2
-    
     single_image = each_image[:, 
                              h_center - half_crop:h_center + half_crop,
                              w_center - half_crop:w_center + half_crop]
     
-    return iter_idx, single_image, positions_tensor, M, magnitude, psf_image
+    # Prepare PSF for anacal (INSIDE WORKER)
+    if config.get('variable_psf', False):
+        psf_for_anacal = GalSimPsfWrapper(
+            psf, 
+            pixel_scale=config['pixel_scale'],
+            npix=config.get('psf_size', 64),
+            is_variable=True
+        )
+    else:
+        psf_size = config.get('psf_size', 64)
+        psf_for_anacal = get_psf_image(psf, psf_size=psf_size, pixel_scale=config['pixel_scale'])
+    
+    # Run anacal INSIDE the worker process
+    try:
+        e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections = anacal_single_image(
+            single_image, 
+            positions_tensor, 
+            g1_val, 
+            g2_val, 
+            psf_for_anacal,
+            npix=config.get('psf_size', 64),
+            sigma_arcsec=config.get('sigma_arcsec', 0.52),
+            pixel_scale=config['pixel_scale'],
+            noise_variance=config.get('noise_variance', 0.354)
+        )
+        
+        anacal_results = {
+            'e1_sum': float(e1_sum),
+            'e1g1_sum': float(e1g1_sum),
+            'e2_sum': float(e2_sum),
+            'e2g2_sum': float(e2g2_sum),
+            'num_detections': int(num_detections)
+        }
+    except Exception as e:
+        print(f"Anacal failed for image {iter_idx}: {e}")
+        anacal_results = {
+            'e1_sum': 0.0,
+            'e1g1_sum': 0.0,
+            'e2_sum': 0.0,
+            'e2g2_sum': 0.0,
+            'num_detections': 0
+        }
+    
+    # Return only picklable objects
+    return iter_idx, single_image, positions_tensor, M, magnitude, anacal_results
 
 class StreamingBatchTensorManager:
     """
@@ -448,7 +539,7 @@ class StreamingBatchTensorManager:
             
             # Check if we need to expand tensors
             if n_tile_sources > max_sources_per_tile:
-                print(f"⚠️  Tile ({tile_row}, {tile_col}) has {n_tile_sources} sources, expanding tensors...")
+                print(f"Tile ({tile_row}, {tile_col}) has {n_tile_sources} sources, expanding tensors...")
                 self._expand_batch_catalog_tensors(n_tile_sources)
                 max_sources_per_tile = n_tile_sources
             
@@ -491,6 +582,58 @@ class StreamingBatchTensorManager:
         except Exception as e:
             print(f"Anacal processing failed for image {global_idx}: {e}")
 
+        self.total_processed += 1
+
+    def add_image_to_batch_with_anacal(self, global_idx, image, positions, n_sources, g1, g2, anacal_results):
+        """Add a single image to the current batch with pre-computed anacal results"""
+        batch_start_idx = (self.current_batch_num - 1) * self.batch_size
+        local_idx = global_idx - batch_start_idx
+        
+        if self.current_batch_images is None:
+            self.initialize_batch_tensors(image, n_sources)
+        
+        # Add image
+        if len(image.shape) == 4:
+            image = image.squeeze(0)
+        self.current_batch_images[local_idx] = image
+
+        # Add catalog with tiling
+        tile_assignments = self.assign_sources_to_tiles(positions.numpy(), g1, g2)
+        max_sources_per_tile = self.current_batch_catalog["locs"].shape[3]
+        
+        for (tile_row, tile_col), tile_data in tile_assignments.items():
+            n_tile_sources = len(tile_data['positions'])
+            
+            if n_tile_sources > max_sources_per_tile:
+                print(f"⚠️  Tile ({tile_row}, {tile_col}) has {n_tile_sources} sources, expanding tensors...")
+                self._expand_batch_catalog_tensors(n_tile_sources)
+                max_sources_per_tile = n_tile_sources
+            
+            if n_tile_sources > 0:
+                tile_positions = torch.tensor(tile_data['positions'], dtype=torch.float32)
+                self.current_batch_catalog["locs"][local_idx, tile_row, tile_col, :n_tile_sources] = tile_positions
+                self.current_batch_catalog["n_sources"][local_idx, tile_row, tile_col] = n_tile_sources
+                
+                g1_tensor = torch.tensor(tile_data['g1_values'], dtype=torch.float32).unsqueeze(-1)
+                g2_tensor = torch.tensor(tile_data['g2_values'], dtype=torch.float32).unsqueeze(-1)
+                
+                self.current_batch_catalog["shear_1"][local_idx, tile_row, tile_col, :n_tile_sources] = g1_tensor
+                self.current_batch_catalog["shear_2"][local_idx, tile_row, tile_col, :n_tile_sources] = g2_tensor
+    
+        # Store pre-computed anacal results
+        self.current_batch_anacal['e1_sum'][local_idx] = anacal_results['e1_sum']
+        self.current_batch_anacal['e1g1_sum'][local_idx] = anacal_results['e1g1_sum']
+        self.current_batch_anacal['e2_sum'][local_idx] = anacal_results['e2_sum']
+        self.current_batch_anacal['e2g2_sum'][local_idx] = anacal_results['e2g2_sum']
+        self.current_batch_anacal['num_detections'][local_idx] = anacal_results['num_detections']
+        
+        # Store in global results
+        self.anacal_results['e1_sum'][global_idx] = anacal_results['e1_sum']
+        self.anacal_results['e1g1_sum'][global_idx] = anacal_results['e1g1_sum']
+        self.anacal_results['e2_sum'][global_idx] = anacal_results['e2_sum']
+        self.anacal_results['e2g2_sum'][global_idx] = anacal_results['e2g2_sum']
+        self.anacal_results['num_detections'][global_idx] = anacal_results['num_detections']
+        
         self.total_processed += 1
 
     def _expand_batch_catalog_tensors(self, new_max_sources):
@@ -841,7 +984,7 @@ def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=Non
                 ))
             
             with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                future_to_idx = {executor.submit(process_single_image, args): args[0] for args in args_list}
+                future_to_idx = {executor.submit(process_single_image_with_anacal, args): args[0] for args in args_list}
                 
                 for future in tqdm(
                     concurrent.futures.as_completed(future_to_idx),
@@ -850,7 +993,7 @@ def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=Non
                     unit="img"
                 ):
                     iter_idx, single_image, positions_tensor, M, magnitude, psf_image = future.result()
-                    batch_manager.add_image_to_batch(
+                    batch_manager.add_image_to_batch_with_anacal(
                         iter_idx, single_image, positions_tensor, M, g1[iter_idx], g2[iter_idx], psf_image)
                     
                     if aggressive_gc and iter_idx % 5 == 0:
