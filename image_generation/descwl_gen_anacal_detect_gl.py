@@ -288,10 +288,7 @@ def process_single_image_with_anacal(args):
     (iter_idx, config, g1_val, g2_val, rng_state, psf_config, layout, shifts, 
      star_config, generate_star, star_setting) = args
     
-    rng = np.random.RandomState()
-    rng.set_state(rng_state)
-    for _ in range(iter_idx):
-        rng.rand()
+    rng = np.random.RandomState(config['seed'] + iter_idx)
     
     # Create PSF inside the worker process
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
