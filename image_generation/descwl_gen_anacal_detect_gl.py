@@ -142,6 +142,170 @@ def clear_batch_memory(batch_manager):
     cleanup_memory(aggressive=True)
     print(f"Batch {batch_manager.current_batch_num} cleared from memory")
 
+def combine_multiband_images(images_tensor, method='weighted'):
+    """
+    Combine multi-band images into single image for anacal processing.
+    
+    Parameters:
+    -----------
+    images_tensor : torch.Tensor
+        Shape: [n_bands, height, width]
+    method : str
+        'weighted': Weight by typical survey depths (g:1, r:1.5, i:2, z:1.5)
+        'mean': Simple average across bands
+    
+    Returns:
+    --------
+    combined_image : torch.Tensor
+        Single image [height, width]
+    """
+    
+    if method == 'weighted':
+        # Typical LSST depth weighting for g, r, i, z
+        weights = torch.tensor([1.0, 1.5, 2.0, 1.5])
+        weights = weights[:images_tensor.shape[0]]  # Handle if fewer bands
+        weights = weights / weights.sum()
+        combined = torch.sum(images_tensor * weights.view(-1, 1, 1), dim=0)
+    
+    elif method == 'mean':
+        combined = torch.mean(images_tensor, dim=0)
+    
+    else:
+        raise ValueError(f"Unknown combination method: {method}")
+    
+    return combined
+
+def combine_multiband_masks(masks_dict, method='first_only'):
+    """
+    Combine masks from multiple bands into a single mask.
+    """
+    if not masks_dict:
+        return None
+    
+    band_names = list(masks_dict.keys())
+    first_mask = masks_dict[band_names[0]]
+    
+    if method == 'union':
+        # Logical OR: flag pixel if bad in ANY band
+        combined_mask = np.zeros_like(first_mask, dtype=np.float32)
+        for band, mask in masks_dict.items():
+            combined_mask = np.logical_or(combined_mask, mask).astype(np.float32)
+    
+    elif method == 'first_only':
+        # xlens approach: use only g-band mask
+        combined_mask = first_mask.copy()
+    
+    elif method == 'intersection':
+        # Logical AND: flag pixel only if bad in ALL bands
+        combined_mask = np.ones_like(first_mask, dtype=np.float32)
+        for band, mask in masks_dict.items():
+            combined_mask = np.logical_and(combined_mask, mask).astype(np.float32)
+    
+    elif method == 'weighted':
+        # Weight by typical survey depths
+        weights = {'g': 1.0, 'r': 1.5, 'i': 2.0, 'z': 1.5}
+        weighted_sum = np.zeros_like(first_mask, dtype=np.float32)
+        weight_total = 0.0
+        
+        for band, mask in masks_dict.items():
+            w = weights.get(band, 1.0)
+            weighted_sum += mask.astype(np.float32) * w
+            weight_total += w
+        
+        combined_mask = (weighted_sum / weight_total > 0.5).astype(np.float32)
+    
+    else:
+        raise ValueError(f"Unknown combination method: {method}")
+    
+    return combined_mask
+
+def anacal_multiband_combined(images_tensor, catalog, g1, g2, psf_input, masks_dict=None,
+                             combine_method='weighted', mask_combine_method='first_only', npix=64, sigma_arcsec=0.52,
+                             mag_zero=30.0, pixel_scale=0.2, noise_variance=0.354):
+    """
+    Process multi-band images by combining them first, then running anacal.
+    
+    Parameters:
+    -----------
+    images_tensor : torch.Tensor
+        Shape: [n_bands, height, width] - YOUR MULTI-BAND IMAGE
+    catalog : torch.Tensor
+        Source positions, shape: [n_sources, 2]
+    g1, g2 : float
+        Applied shear values
+    psf_input : np.ndarray or PSF object
+        PSF for measurement
+    combine_method : str
+        How to combine bands ('weighted' or 'mean')
+    
+    Returns:
+    --------
+    e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections, out
+        Anacal measurement results
+    """
+    
+    combined_image = combine_multiband_images(images_tensor, method=combine_method)
+    gal_array = combined_image.numpy()
+    
+    combined_mask = None
+    if masks_dict is not None:
+        combined_mask = combine_multiband_masks(masks_dict, method=mask_combine_method)
+        # print(f"Combined mask: {np.sum(combined_mask > 0)} masked pixels out of {combined_mask.size}")
+
+    noise_array = torch.normal(
+        mean=torch.zeros(gal_array.shape),
+        std=np.sqrt(noise_variance) * torch.ones(gal_array.shape)
+    ).numpy()
+    
+    fpfs_config = anacal.fpfs.FpfsConfig(
+        npix=npix,
+        sigma_arcsec=sigma_arcsec,
+    )
+    
+    if isinstance(psf_input, np.ndarray):
+        # Fixed PSF
+        out = anacal.fpfs.process_image(
+            fpfs_config=fpfs_config,
+            mag_zero=mag_zero,
+            gal_array=gal_array,
+            psf_array=psf_input,
+            pixel_scale=pixel_scale,
+            noise_variance=noise_variance,
+            noise_array=noise_array,
+            mask_array=combined_mask,
+            detection=None,
+        )
+    else:
+        # Variable PSF object
+        center_psf = psf_input.draw(gal_array.shape[1]//2, gal_array.shape[0]//2)
+        out = anacal.fpfs.process_image(
+            fpfs_config=fpfs_config,
+            mag_zero=mag_zero,
+            gal_array=gal_array,
+            psf_array=center_psf,
+            psf_object=psf_input,
+            pixel_scale=pixel_scale,
+            noise_variance=noise_variance,
+            noise_array=noise_array,
+            mask_array=combined_mask,
+            detection=None,
+        )
+    
+    # STEP 4: Extract results (UNCHANGED from your code)
+    e1 = out["fpfs_w"] * out["fpfs_e1"]
+    e1g1 = out["fpfs_dw_dg1"] * out["fpfs_e1"] + out["fpfs_w"] * out["fpfs_de1_dg1"]
+    e1_sum = np.sum(e1)
+    e1g1_sum = np.sum(e1g1)
+    
+    e2 = out["fpfs_w"] * out["fpfs_e2"]
+    e2g2 = out["fpfs_dw_dg2"] * out["fpfs_e2"] + out["fpfs_w"] * out["fpfs_de2_dg2"]
+    e2_sum = np.sum(e2)
+    e2g2_sum = np.sum(e2g2)
+    
+    num_detections = len(e1)
+    
+    return e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections, out
+
 class GalSimPsfWrapper(anacal.psf.BasePsf):
     """Wrapper to make GalSim PSF objects compatible with anacal"""
     
@@ -295,7 +459,7 @@ def process_single_image_with_anacal(args):
     psf = create_psf_for_worker(config, se_dim, config['seed'] + iter_idx)
     
     # Generate image
-    each_image, positions_tensor, M, magnitude = Generate_single_img_catalog(
+    each_image, positions_tensor, M, magnitude, masks_dict = Generate_single_img_catalog(
         rng, config['mag'], config['hlr'], psf, config['morph'], 
         config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
         config['sep'], g1_val, g2_val, config['bands'], config['noise_factor'], 
@@ -310,9 +474,14 @@ def process_single_image_with_anacal(args):
     crop_size = 2048
     h_center, w_center = each_image.shape[1] // 2, each_image.shape[2] // 2
     half_crop = crop_size // 2
-    single_image = each_image[:, 
+    multiband_image = each_image[:, 
                              h_center - half_crop:h_center + half_crop,
                              w_center - half_crop:w_center + half_crop]
+
+    cropped_masks = {}
+    for band, mask in masks_dict.items():
+        cropped_masks[band] = mask[h_center - half_crop:h_center + half_crop,
+                                   w_center - half_crop:w_center + half_crop]
     
     # Prepare PSF for anacal (INSIDE WORKER)
     if config.get('variable_psf', False):
@@ -328,17 +497,21 @@ def process_single_image_with_anacal(args):
     
     # Run anacal INSIDE the worker process
     try:
-        e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections = anacal_single_image(
-            single_image, 
-            positions_tensor, 
-            g1_val, 
-            g2_val, 
-            psf_for_anacal,
-            npix=config.get('psf_size', 64),
-            sigma_arcsec=config.get('sigma_arcsec', 0.52),
-            pixel_scale=config['pixel_scale'],
-            noise_variance=config.get('noise_variance', 0.354)
-        )
+        e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections, _ = \
+            anacal_multiband_combined(
+                multiband_image,           # NOW: multi-band tensor [n_bands, 2048, 2048]
+                positions_tensor, 
+                g1_val, 
+                g2_val, 
+                psf_for_anacal,
+                masks_dict=cropped_masks,
+                combine_method=config.get('combine_method', 'weighted'),  # NEW: specify combination
+                mask_combine_method=config.get('mask_combine_method', 'first_only'),
+                npix=config.get('psf_size', 64),
+                sigma_arcsec=config.get('sigma_arcsec', 0.52),
+                pixel_scale=config['pixel_scale'],
+                noise_variance=config.get('noise_variance', 0.354)
+            )
         
         anacal_results = {
             'e1_sum': float(e1_sum),
@@ -358,7 +531,7 @@ def process_single_image_with_anacal(args):
         }
     
     # Return only picklable objects
-    return iter_idx, single_image, positions_tensor, M, magnitude, anacal_results
+    return iter_idx, multiband_image, positions_tensor, M, magnitude, anacal_results
 
 class StreamingBatchTensorManager:
     """
@@ -478,9 +651,18 @@ class StreamingBatchTensorManager:
         """Initialize tensors for current batch with TILED structure"""
         print(f"Initializing tiled batch tensors for {self.current_batch_size} images...")
         
-        # Image tensor dimensions: [batch_size, channels, height, width] - UNCHANGED
-        channels, height, width = sample_image.shape
-        print(f"Batch image tensor: [{self.current_batch_size}, {channels}, {height}, {width}]")
+        if len(sample_image.shape) == 3:  # [n_bands, height, width]
+            sample_image = combine_multiband_images(sample_image, method='weighted')
+    
+        # Image tensor dimensions: [batch_size, channels, height, width]
+        # Now we store the COMBINED image (1 channel) for memory efficiency
+        if len(sample_image.shape) == 2:  # [height, width]
+            height, width = sample_image.shape
+            channels = 1
+        else:
+            channels, height, width = sample_image.shape
+        
+        print(f"Batch image tensor (combined): [{self.current_batch_size}, {channels}, {height}, {width}]")
         
         # Initialize batch image tensor 
         self.current_batch_images = torch.zeros(self.current_batch_size, channels, height, width, dtype=torch.float32)
@@ -589,9 +771,15 @@ class StreamingBatchTensorManager:
         if self.current_batch_images is None:
             self.initialize_batch_tensors(image, n_sources)
         
-        # Add image
-        if len(image.shape) == 4:
-            image = image.squeeze(0)
+        if len(image.shape) == 3:  # [n_bands, height, width]
+            image = combine_multiband_images(image, method='weighted')
+        elif len(image.shape) == 4:  # [1, n_bands, height, width]
+            image = combine_multiband_images(image.squeeze(0), method='weighted')
+    
+        # Now image is [height, width]
+        if len(image.shape) == 2:
+            image = image.unsqueeze(0)  # Add channel dimension: [1, height, width]
+
         self.current_batch_images[local_idx] = image
 
         # Add catalog with tiling
@@ -867,8 +1055,14 @@ def Generate_single_img_catalog(
     for i, band in enumerate(bands):
         image_np = sim_data['band_data'][band][0].image.array
         image_tensor[i] = torch.from_numpy(image_np.copy())
+
+    masks_dict = {}
+    for band in bands:
+        exposure = sim_data['band_data'][band][0]
+        mask_array = exposure.mask.array.astype(np.float32)
+        masks_dict[band] = mask_array
     
-    return image_tensor, positions_tensor, M, magnitude
+    return image_tensor, positions_tensor, M, magnitude, masks_dict
 
 def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=None):
     """
@@ -989,9 +1183,9 @@ def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=Non
                     desc=f"Batch {batch_num} (MP)",
                     unit="img"
                 ):
-                    iter_idx, single_image, positions_tensor, M, magnitude, psf_image = future.result()
+                    iter_idx, multiband_image, positions_tensor, M, magnitude, anacal_results = future.result()
                     batch_manager.add_image_to_batch_with_anacal(
-                        iter_idx, single_image, positions_tensor, M, g1[iter_idx], g2[iter_idx], psf_image)
+                        iter_idx, multiband_image, positions_tensor, M, g1[iter_idx], g2[iter_idx], anacal_results)
                     
                     if aggressive_gc and iter_idx % 5 == 0:
                         cleanup_memory(aggressive=True)
