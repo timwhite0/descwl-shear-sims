@@ -31,6 +31,54 @@ print(f"  Used:  {used // (2**30)} GiB")
 print(f"  Free:  {free // (2**30)} GiB")
 space_available = free // (2**30)
 
+# Default bad mask planes from xlens
+badMaskDefault = [
+    "BAD",
+    "SAT",
+    "CR",
+    "NO_DATA",
+    "UNMASKEDNAN",
+    "CROSSTALK",
+    "INTRP",
+    "STREAK",
+    "VIGNETTED",
+    "CLIPPED",
+]
+
+def extract_mask_xlens_style(exposure, badMaskPlanes=None):
+    """Extract mask array following xlens logic"""
+    if badMaskPlanes is None:
+        badMaskPlanes = badMaskDefault
+    
+    # Get bitmask for the specified bad mask planes
+    bitv = exposure.mask.getPlaneBitMask(badMaskPlanes)
+    
+    # Check which pixels have ANY of the bad mask planes set
+    mask_from_planes = (exposure.mask.array & bitv) != 0
+    
+    # Mask pixels with highly negative values (< -6 sigma)
+    variance_safe = np.where(
+        exposure.variance.array < 0,
+        0, 
+        exposure.variance.array
+    )
+    negative_threshold = -6.0 * np.sqrt(variance_safe)
+    mask_from_negative = exposure.image.array < negative_threshold
+    
+    # Combine both masks
+    mask_array = (mask_from_planes | mask_from_negative).astype(np.int16)
+    
+    return mask_array
+
+def extract_masks_dict_xlens_style(sim_data, bands, badMaskPlanes=None):
+    """Extract masks for all bands following xlens logic"""
+    masks_dict = {}
+    for band in bands:
+        exposure = sim_data['band_data'][band][0]
+        mask_array = extract_mask_xlens_style(exposure, badMaskPlanes)
+        masks_dict[band] = mask_array
+    return masks_dict
+
 def cleanup_memory(aggressive=True):
     if aggressive:
         import gc
@@ -1056,10 +1104,27 @@ def Generate_single_img_catalog(
         image_np = sim_data['band_data'][band][0].image.array
         image_tensor[i] = torch.from_numpy(image_np.copy())
 
+    # DESCWL mask extraction (matches xlens as closely as possible)
     masks_dict = {}
     for band in bands:
         exposure = sim_data['band_data'][band][0]
-        mask_array = exposure.mask.array.astype(np.float32)
+        
+        # Get DESCWL's actual mask planes
+        try:
+            descwl_planes = ["CR", "BAD"]
+            bitv = exposure.mask.getPlaneBitMask(descwl_planes)
+            mask_from_descwl = (exposure.mask.array & bitv) != 0
+        except Exception:
+            mask_from_descwl = exposure.mask.array != 0
+        
+        # Add xlens-style negative pixel detection
+        try:
+            variance_safe = np.where(exposure.variance.array < 0, 0, exposure.variance.array)
+            mask_from_negative = exposure.image.array < (-6.0 * np.sqrt(variance_safe))
+            mask_array = (mask_from_descwl | mask_from_negative).astype(np.int16)
+        except Exception:
+            mask_array = mask_from_descwl.astype(np.int16)
+        
         masks_dict[band] = mask_array
     
     return image_tensor, positions_tensor, M, magnitude, masks_dict
