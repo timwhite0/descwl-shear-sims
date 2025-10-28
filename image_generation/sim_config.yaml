@@ -5,15 +5,16 @@ stop_on_multiprocessing_fail: true
 # Memory management settings
 memory_management:
   monitor_memory: false
-  batch_size: 100
+  batch_size: 500
   aggressive_gc: true
 
 # Data generation settings  
-num_data: 2000       # number of images to generate
-seed: 1234
+num_data: 14000       # number of images to generate
+setting: NPE_fix_psf_no_star_no_artifact_galaxy_240
+seed: 11
 
 # VARIABLE PSF setting
-variable_psf: true
+variable_psf: false
 variation_factor: 1.0
 save_psf_param: true
 psf_size: 64
@@ -23,6 +24,7 @@ psf_type: "moffat"          # "moffat" or "gauss"
 morph: 'exp'                
 
 # other setting
+n_tiles_per_side: 1         # number of tiles on each side
 mag: 17.0                   # 17.0 is default
 hlr: 0.5                    # 0.5 is default
 pixel_scale: 0.2            # 0.2 is default
@@ -35,24 +37,27 @@ noise_factor: 1             # 0.58 is default
 dither: false               # False is default
 dither_size: 0.5            # 0.5 is default
 rotate: false               # False is default
-cosmic_rays: true          
-bad_columns: true       
-shear_setting: vary       # vary or const
+shear_setting: vary         # vary or const
+catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed' 
 
-density: 240                 # GALAXY density: per square arcmin, 80 is default  
+# image artifacts
+cosmic_rays: false          
+bad_columns: false       
 
-setting: Anacal_WLD_240_star_max_100_with_bccr_mask
+# GALAXY density: per square arcmin, 80 is default  
+density: 240                 
 
-catalog_type: 'wldeblend'   # 'wldeblend' or 'fixed'   
-select_observable: 'i_ab'   # column name in the WLDEBlend catalog
-select_lower_limit: null
-select_upper_limit: 27 
-n_tiles_per_side: 1
+# limit the magnitude of a certain band
+select_observable: 'i_ab'   # column name in the WeakLensingDeblend catalog
+select_lower_limit: null    # minimum magnitude
+select_upper_limit: 27      # maximum magnitude
+
 
 # Star configuration
-generate_star: true # set to false to disable star catalog
+generate_star: false # set to false to disable star catalog
 star_bleeds: true 
 
+# STAR density
 star_config:
   max_density: 100 
   # density: 10 
@@ -62,7 +67,17 @@ star_setting:
   star_filter_mag: 18.0
   star_filter_band: 'r'
 
+# bright star masking for Anacal
+star_catalog:
+  mag_threshold: 18.0
+  band: 'r'
+  radius_scale: 5.0
+  min_radius: 5.0
+  max_radius: 50.0
+
+# whether draw bright star
 draw_bright: true
 
+# settings for multi-band anacal detection
 combine_method: 'weighted'
-# mask_combine_method: 'first_only'
+mask_combine_method: 'first_only'
