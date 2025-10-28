@@ -31,6 +31,85 @@ print(f"  Used:  {used // (2**30)} GiB")
 print(f"  Free:  {free // (2**30)} GiB")
 space_available = free // (2**30)
 
+def create_bright_star_catalog(star_catalog, mag_threshold=18.0, band='r', 
+                               radius_scale=5.0, min_radius=5.0, max_radius=50.0):
+    """
+    FIXED: Handles both regular 2D arrays and structured arrays
+    """
+    if star_catalog is None or len(star_catalog) == 0:
+        return None
+    
+    try:
+        star_data = star_catalog._star_cat
+        current_indices = star_catalog.indices
+        
+        # Get magnitudes
+        mag_column = f'{band}_ab'
+        if mag_column not in star_data.dtype.names:
+            available_bands = [col.replace('_ab', '') for col in star_data.dtype.names if '_ab' in col]
+            if available_bands:
+                band = available_bands[0]
+                mag_column = f'{band}_ab'
+            else:
+                print(f"WARNING: No magnitude columns found!")
+                return None
+        
+        magnitudes = star_data[mag_column][current_indices]
+        bright_mask = np.isfinite(magnitudes) & (magnitudes < mag_threshold)
+        n_bright = np.sum(bright_mask)
+        
+        if n_bright == 0:
+            return None
+        
+        # FIX: Handle different array formats
+        star_positions = star_catalog.shifts_array
+        
+        if len(star_positions.shape) == 2:
+            # Regular 2D array: (n_stars, 2)
+            star_positions = star_positions[bright_mask]
+            
+        elif len(star_positions.shape) == 1:
+            # Structured array with named fields
+            if star_positions.dtype.names is not None:
+                filtered_positions = star_positions[bright_mask]
+                
+                # Try common field name combinations
+                if 'x' in star_positions.dtype.names and 'y' in star_positions.dtype.names:
+                    star_positions = np.column_stack([filtered_positions['x'], filtered_positions['y']])
+                elif 'ra' in star_positions.dtype.names and 'dec' in star_positions.dtype.names:
+                    star_positions = np.column_stack([filtered_positions['ra'], filtered_positions['dec']])
+                elif len(star_positions.dtype.names) >= 2:
+                    # Use first two fields as x, y
+                    field1, field2 = star_positions.dtype.names[:2]
+                    star_positions = np.column_stack([filtered_positions[field1], filtered_positions[field2]])
+                else:
+                    print(f"WARNING: Cannot parse position fields: {star_positions.dtype.names}")
+                    return None
+            else:
+                # 1D flattened array - reshape to (N, 2)
+                star_positions = star_positions.reshape(-1, 2)
+                star_positions = star_positions[bright_mask]
+        else:
+            print(f"WARNING: Unexpected shape: {star_positions.shape}")
+            return None
+        
+        bright_mags = magnitudes[bright_mask]
+        radii = radius_scale * 10**((mag_threshold - bright_mags) / 2.5)
+        radii = np.clip(radii, min_radius, max_radius)
+        
+        bright_star_catalog = np.zeros(n_bright, dtype=[('x', 'f8'), ('y', 'f8'), ('r', 'f8')])
+        bright_star_catalog['x'] = star_positions[:, 0]
+        bright_star_catalog['y'] = star_positions[:, 1]
+        bright_star_catalog['r'] = radii
+        
+        return bright_star_catalog
+        
+    except Exception as e:
+        print(f"ERROR in create_bright_star_catalog: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 # Default bad mask planes from xlens
 badMaskDefault = [
     "BAD",
@@ -268,28 +347,11 @@ def combine_multiband_masks(masks_dict, method='first_only'):
     return combined_mask
 
 def anacal_multiband_combined(images_tensor, catalog, g1, g2, psf_input, masks_dict=None,
-                             combine_method='weighted', mask_combine_method='first_only', npix=64, sigma_arcsec=0.52,
+                             combine_method='weighted', mask_combine_method='first_only', star_catalog=None, npix=64, sigma_arcsec=0.52,
                              mag_zero=30.0, pixel_scale=0.2, noise_variance=0.354):
     """
     Process multi-band images by combining them first, then running anacal.
     
-    Parameters:
-    -----------
-    images_tensor : torch.Tensor
-        Shape: [n_bands, height, width] - YOUR MULTI-BAND IMAGE
-    catalog : torch.Tensor
-        Source positions, shape: [n_sources, 2]
-    g1, g2 : float
-        Applied shear values
-    psf_input : np.ndarray or PSF object
-        PSF for measurement
-    combine_method : str
-        How to combine bands ('weighted' or 'mean')
-    
-    Returns:
-    --------
-    e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections, out
-        Anacal measurement results
     """
     
     combined_image = combine_multiband_images(images_tensor, method=combine_method)
@@ -321,6 +383,7 @@ def anacal_multiband_combined(images_tensor, catalog, g1, g2, psf_input, masks_d
             noise_variance=noise_variance,
             noise_array=noise_array,
             mask_array=combined_mask,
+            star_catalog=star_catalog,
             detection=None,
         )
     else:
@@ -336,6 +399,7 @@ def anacal_multiband_combined(images_tensor, catalog, g1, g2, psf_input, masks_d
             noise_variance=noise_variance,
             noise_array=noise_array,
             mask_array=combined_mask,
+            star_catalog=star_catalog,
             detection=None,
         )
     
@@ -507,7 +571,7 @@ def process_single_image_with_anacal(args):
     psf = create_psf_for_worker(config, se_dim, config['seed'] + iter_idx)
     
     # Generate image
-    each_image, positions_tensor, M, magnitude, masks_dict = Generate_single_img_catalog(
+    each_image, positions_tensor, M, magnitude, masks_dict, star_catalog_obj = Generate_single_img_catalog(
         rng, config['mag'], config['hlr'], psf, config['morph'], 
         config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
         config['sep'], g1_val, g2_val, config['bands'], config['noise_factor'], 
@@ -530,6 +594,42 @@ def process_single_image_with_anacal(args):
     for band, mask in masks_dict.items():
         cropped_masks[band] = mask[h_center - half_crop:h_center + half_crop,
                                    w_center - half_crop:w_center + half_crop]
+
+    # NEW CODE BLOCK: Create bright star catalog for anacal
+    bright_star_catalog = None
+    if star_catalog_obj is not None:
+        # Get configuration for star catalog creation
+        star_mag_threshold = config.get('star_catalog', {}).get('mag_threshold', 18.0)
+        star_band = config.get('star_catalog', {}).get('band', 'r')
+        star_radius_scale = config.get('star_catalog', {}).get('radius_scale', 5.0)
+        star_min_radius = config.get('star_catalog', {}).get('min_radius', 5.0)
+        star_max_radius = config.get('star_catalog', {}).get('max_radius', 50.0)
+        
+        bright_star_catalog = create_bright_star_catalog(
+            star_catalog_obj,
+            mag_threshold=star_mag_threshold,
+            band=star_band,
+            radius_scale=star_radius_scale,
+            min_radius=star_min_radius,
+            max_radius=star_max_radius
+        )
+        
+        # Adjust star positions for cropping
+        if bright_star_catalog is not None:
+            bright_star_catalog['x'] -= (w_center - half_crop)
+            bright_star_catalog['y'] -= (h_center - half_crop)
+            
+            # Filter out stars outside the cropped region
+            in_bounds = (
+                (bright_star_catalog['x'] >= 0) & 
+                (bright_star_catalog['x'] < crop_size) &
+                (bright_star_catalog['y'] >= 0) & 
+                (bright_star_catalog['y'] < crop_size)
+            )
+            bright_star_catalog = bright_star_catalog[in_bounds]
+            
+            if len(bright_star_catalog) == 0:
+                bright_star_catalog = None
     
     # Prepare PSF for anacal (INSIDE WORKER)
     if config.get('variable_psf', False):
@@ -553,6 +653,7 @@ def process_single_image_with_anacal(args):
                 g2_val, 
                 psf_for_anacal,
                 masks_dict=cropped_masks,
+                star_catalog=bright_star_catalog,
                 combine_method=config.get('combine_method', 'weighted'),  # NEW: specify combination
                 mask_combine_method=config.get('mask_combine_method', 'first_only'),
                 npix=config.get('psf_size', 64),
@@ -1021,8 +1122,9 @@ def Generate_single_img_catalog(
         magnitude = []
 
     # CREATE STAR CATALOG PER IMAGE
+    star_catalog_obj = None
     if generate_star:
-        star_catalog = make_star_catalog(
+        star_catalog_obj = make_star_catalog(
             rng=rng,  
             coadd_dim=coadd_dim,
             buff=buff,
@@ -1033,8 +1135,8 @@ def Generate_single_img_catalog(
         # Apply filtering if configured
         star_filter = star_setting.get('star_filter', False)
         if star_filter:
-            star_catalog = filter_bright_stars_production(
-                star_catalog, 
+            star_catalog_obj = filter_bright_stars_production(
+                star_catalog_obj, 
                 mag_threshold=star_setting.get('star_filter_mag', 18), 
                 band=star_setting.get('star_filter_band', 'r'), 
                 verbose=False  # Set to False to reduce log spam
@@ -1045,7 +1147,7 @@ def Generate_single_img_catalog(
         sim_data = make_sim(
             rng=rng,
             galaxy_catalog=galaxy_catalog,
-            star_catalog=star_catalog,
+            star_catalog=star_catalog_obj,
             coadd_dim=coadd_dim,
             g1=g1,
             g2=g2,
@@ -1127,7 +1229,7 @@ def Generate_single_img_catalog(
         
         masks_dict[band] = mask_array
     
-    return image_tensor, positions_tensor, M, magnitude, masks_dict
+    return image_tensor, positions_tensor, M, magnitude, masks_dict, star_catalog_obj
 
 def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=None):
     """
