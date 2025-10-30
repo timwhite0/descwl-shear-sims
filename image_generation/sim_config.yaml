@@ -1,20 +1,20 @@
 use_multiprocessing: true  
-n_workers: 24        # Number of parallel workers 
+n_workers: 32        # Number of parallel workers 
 stop_on_multiprocessing_fail: true
 
 # Memory management settings
 memory_management:
   monitor_memory: false
-  batch_size: 500
+  batch_size: 200
   aggressive_gc: true
 
 # Data generation settings  
 num_data: 14000       # number of images to generate
-setting: NPE_fix_psf_no_star_no_artifact_galaxy_240
+setting:  NPE_vary_psf_star_2_to_100_no_artifact_galaxy_240
 seed: 11
 
 # VARIABLE PSF setting
-variable_psf: false
+variable_psf: true
 variation_factor: 1.0
 save_psf_param: true
 psf_size: 64
@@ -54,7 +54,7 @@ select_upper_limit: 27      # maximum magnitude
 
 
 # Star configuration
-generate_star: false # set to false to disable star catalog
+generate_star: true # set to false to disable star catalog
 star_bleeds: true 
 
 # STAR density
@@ -62,10 +62,14 @@ star_config:
   max_density: 100 
   # density: 10 
 
+# whether to filter star
 star_setting:
-  star_filter: true
+  star_filter: false
   star_filter_mag: 18.0
   star_filter_band: 'r'
+
+# whether draw bright star
+draw_bright: true
 
 # bright star masking for Anacal
 star_catalog:
@@ -74,9 +78,6 @@ star_catalog:
   radius_scale: 5.0
   min_radius: 5.0
   max_radius: 50.0
-
-# whether draw bright star
-draw_bright: true
 
 # settings for multi-band anacal detection
 combine_method: 'weighted'

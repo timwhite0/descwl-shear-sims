@@ -231,6 +231,11 @@ def save_batch_to_disk(batch_manager, save_anacal=True):
     anacal_success = True
     if save_anacal and batch_manager.current_batch_anacal:
         anacal_success = safe_save_tensor(batch_manager.current_batch_anacal, batch_anacal_file)
+
+        cumulative_anacal_file = f"{batch_manager.save_folder}/anacal_results_checkpoint.pt"
+        cumulative_success = safe_save_tensor(batch_manager.anacal_results, cumulative_anacal_file)
+        if cumulative_success:
+            print(f"Checkpoint: Saved cumulative anacal results through batch {batch_manager.current_batch_num}")
     
     overall_success = image_success and catalog_success and anacal_success
     
