@@ -21,6 +21,8 @@ import tempfile
 import shutil
 import galsim 
 import anacal 
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
 os.environ['CATSIM_DIR'] = '/scratch/regier_root/regier0/taodingr/descwl-shear-sims/catsim' 
 save_folder = f"/scratch/regier_root/regier0/taodingr/descwl-shear-sims/generated_output"
@@ -1406,9 +1408,26 @@ def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=Non
         'anacal_results': batch_manager.anacal_results
     }
 
-def main():
+@hydra.main(version_base=None, config_path="/scratch/regier_root/regier0/taodingr/descwl-shear-sims/image_generation", config_name="sim_config")
+def main(cfg: DictConfig) -> None:
     start_time = time.time()
     start_datetime = datetime.now()
+    # Convert config
+    config = OmegaConf.to_container(cfg, resolve=True)
+
+    # Specify your directory
+    config_save_dir = "/scratch/regier_root/regier0/taodingr/descwl-shear-sims/config_snapshots/Anacal"
+    os.makedirs(config_save_dir, exist_ok=True)
+    
+    # Save config snapshot
+    setting_name = config['setting']
+    timestamp = start_datetime.strftime('%Y%m%d_%H%M%S')
+    config_snapshot_path = os.path.join(config_save_dir, f"config_{setting_name}_{timestamp}.yaml")
+    
+    with open(config_snapshot_path, 'w') as f:
+        f.write(OmegaConf.to_yaml(cfg))
+    
+    print(f"Config snapshot saved to: {config_snapshot_path}")
     
     print(f"=== LARGE TENSOR SIMULATION STARTED ===")
     print(f"Start time: {start_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
