@@ -10,7 +10,7 @@ memory_management:
 
 # Data generation settings  
 num_data: 14000       # number of images to generate
-setting:  NPE_vary_psf_star_2-100_with_artifact_galaxy_80_i
+setting:  NPE_vary_psf_star_2-100_with_artifact_galaxy_80_irz
 
 seed: 11
 
@@ -33,7 +33,7 @@ layout_name: 'random'       # 'random' or 'grid'
 coadd_dim: 2550             # without rotation, image dim is coadd_dim + 1
 buff: 0                     # 0 is default
 sep: 9.5                    # null is default
-bands: ['i']                # ['r', 'i', 'z']      # ['i'] is default
+bands: ['i', 'r', 'z']                # ['r', 'i', 'z']      # ['i'] is default
 noise_factor: 1             # 0.58 is default
 dither: false               # False is default
 dither_size: 0.5            # 0.5 is default

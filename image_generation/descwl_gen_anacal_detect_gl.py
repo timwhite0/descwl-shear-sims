@@ -276,7 +276,7 @@ def clear_batch_memory(batch_manager):
     cleanup_memory(aggressive=True)
     print(f"Batch {batch_manager.current_batch_num} cleared from memory")
 
-def combine_multiband_images(images_tensor, exposures_list=None, method='inverse_variance'):
+def combine_multiband_images(images_tensor, band_variances=None, method='inverse_variance'):
     """
     Combine multi-band images into single image for anacal processing.
     
@@ -284,11 +284,11 @@ def combine_multiband_images(images_tensor, exposures_list=None, method='inverse
     -----------
     images_tensor : torch.Tensor
         Shape: [n_bands, height, width]
-    exposures_list : list of exposures or None
-        If provided, extract variance from actual exposures for proper weighting
+    band_variances : dict or None
+        Dictionary mapping band names to variance values
+        e.g., {'g': 0.099, 'r': 0.138, 'i': 0.354, 'z': 1.344}
     method : str
         'inverse_variance': Weight by 1/variance (xlens approach)
-        'weighted': Weight by typical survey depths (old approach)
         'mean': Simple average across bands
     
     Returns:
@@ -301,28 +301,28 @@ def combine_multiband_images(images_tensor, exposures_list=None, method='inverse
     
     if method == 'inverse_variance':
         # xlens approach: use inverse-variance weighting
-        if exposures_list is not None:
-            # Extract actual variance from exposures
+        if band_variances is not None:
+            # Use actual measured variances from exposures
             weights = []
-            for exposure in exposures_list:
-                variance = exposure.getMaskedImage().variance.array
-                # Use mean variance as representative (like xlens does)
-                finite_variance = variance[np.isfinite(variance)]
-                if finite_variance.size == 0:
-                    raise ValueError("Variance plane must contain at least one finite value")
-                variance_value = float(np.nanmean(variance))
-                if not np.isfinite(variance_value) or variance_value <= 0:
-                    raise ValueError(f"Invalid variance: {variance_value}")
+            band_names = ['g', 'r', 'i', 'z'][:images_tensor.shape[0]]
+            
+            for band in band_names:
+                variance_value = band_variances.get(band, 0.354)
                 weights.append(1.0 / variance_value)
             
             weights = torch.tensor(weights, dtype=torch.float32)
         else:
             # Fallback: use typical LSST variance estimates
-            # Based on 5-sigma depths: g~24.8, r~24.4, i~24.0, z~23.3
-            # Higher depth = lower variance = higher weight
-            typical_variances = torch.tensor([0.354 * 1.2, 0.354 * 0.85, 0.354 * 0.75, 0.354 * 1.0])
+            typical_variances = torch.tensor([0.099, 0.138, 0.354, 1.344])
             typical_variances = typical_variances[:images_tensor.shape[0]]
             weights = 1.0 / typical_variances
+        
+        total_weight = weights.sum()
+        normalized_weights = weights / total_weight
+        combined = torch.sum(images_tensor * normalized_weights.view(-1, 1, 1), dim=0)
+        
+        # Calculate combined variance (xlens formula)
+        combined_variance = 1.0 / total_weight.item()
         
         total_weight = weights.sum()
         normalized_weights = weights / total_weight
@@ -392,8 +392,7 @@ def combine_multiband_masks(masks_dict, method='union'):
 def anacal_multiband_combined(images_tensor, catalog, g1, g2, psf_input, masks_dict=None,
                              combine_method='inverse_variance', mask_combine_method='union', 
                              star_catalog=None, npix=64, sigma_arcsec=0.52,
-                             mag_zero=30.0, pixel_scale=0.2, noise_variance=0.354,
-                             exposures_list=None):  # NEW PARAMETER
+                             mag_zero=30.0, pixel_scale=0.2, band_variances=None):  
     """
     Process multi-band images by combining them first, then running anacal.
     Now uses xlens-style inverse-variance weighting.
@@ -402,7 +401,7 @@ def anacal_multiband_combined(images_tensor, catalog, g1, g2, psf_input, masks_d
     # STEP 1: Combine images with proper inverse-variance weighting
     combined_image, combined_variance = combine_multiband_images(
         images_tensor, 
-        exposures_list=exposures_list,  # Pass exposures if available
+        band_variances=band_variances,  
         method=combine_method
     )
     gal_array = combined_image.numpy()
@@ -646,7 +645,7 @@ def process_single_image_with_anacal(args):
     psf = create_psf_for_worker(config, se_dim, config['seed'] + iter_idx)
     
     # Generate image
-    each_image, positions_tensor, M, magnitude, masks_dict, star_catalog_obj = Generate_single_img_catalog(
+    each_image, positions_tensor, M, magnitude, masks_dict, star_catalog_obj, band_variances = Generate_single_img_catalog(
         rng, config['mag'], config['hlr'], psf, config['morph'], 
         config['pixel_scale'], layout, config['coadd_dim'], config['buff'], 
         config['sep'], g1_val, g2_val, config['bands'], config['noise_factor'], 
@@ -723,6 +722,7 @@ def process_single_image_with_anacal(args):
             # SINGLE-BAND CASE: Use simple anacal_single_image
             band_name = config['bands'][0]  # e.g., 'i'
             single_band_mask = cropped_masks.get(band_name, None)
+            single_band_variance = band_variances.get(band_name, 0.354)
 
             print(f"Image {iter_idx}: Running SINGLE-BAND anacal for band '{config['bands'][0]}'")
             e1_sum, e1g1_sum, e2_sum, e2g2_sum, num_detections = \
@@ -737,7 +737,7 @@ def process_single_image_with_anacal(args):
                     npix=config.get('psf_size', 64),
                     sigma_arcsec=config.get('sigma_arcsec', 0.52),
                     pixel_scale=config['pixel_scale'],
-                    noise_variance=config.get('noise_variance', 0.354)
+                    noise_variance=single_band_variance
                 )
         else:
             # MULTI-BAND CASE: Use existing multi-band logic
@@ -756,7 +756,7 @@ def process_single_image_with_anacal(args):
                     npix=config.get('psf_size', 64),
                     sigma_arcsec=config.get('sigma_arcsec', 0.52),
                     pixel_scale=config['pixel_scale'],
-                    noise_variance=config.get('noise_variance', 0.354)
+                    band_variances=band_variances
                 )
         
         anacal_results = {
@@ -1321,8 +1321,57 @@ def Generate_single_img_catalog(
             mask_array = mask_from_descwl.astype(np.int16)
         
         masks_dict[band] = mask_array
+
+        # NEW: Extract variance from each band's exposure
+    band_variances = {}
     
-    return image_tensor, positions_tensor, M, magnitude, masks_dict, star_catalog_obj
+    for i, band in enumerate(bands):
+        exposure = sim_data['band_data'][band][0]
+        image_np = exposure.image.array
+        image_tensor[i] = torch.from_numpy(image_np.copy())
+        
+        # ✅ Extract variance following xlens's estimate_noise_variance logic
+        variance_array = exposure.variance.array
+        mask_array_for_variance = (
+            (variance_array < 1e9) &
+            (exposure.mask.array == 0)
+        )
+        
+        if np.sum(mask_array_for_variance) < 10:
+            print(f"Warning: Not enough valid pixels for variance estimation in band {band}")
+            band_variances[band] = 0.354  # Fallback
+        else:
+            noise_variance = np.nanmean(variance_array[mask_array_for_variance])
+            if (noise_variance < 1e-10) or np.isnan(noise_variance):
+                print(f"Warning: Invalid variance in band {band}, using default")
+                band_variances[band] = 0.354  # Fallback
+            else:
+                band_variances[band] = float(noise_variance)
+
+    # DESCWL mask extraction (matches xlens as closely as possible)
+    masks_dict = {}
+    for band in bands:
+        exposure = sim_data['band_data'][band][0]
+        
+        # Get DESCWL's actual mask planes
+        try:
+            descwl_planes = ["CR", "BAD"]
+            bitv = exposure.mask.getPlaneBitMask(descwl_planes)
+            mask_from_descwl = (exposure.mask.array & bitv) != 0
+        except Exception:
+            mask_from_descwl = exposure.mask.array != 0
+        
+        # Add xlens-style negative pixel detection
+        try:
+            variance_safe = np.where(exposure.variance.array < 0, 0, exposure.variance.array)
+            mask_from_negative = exposure.image.array < (-6.0 * np.sqrt(variance_safe))
+            mask_array = (mask_from_descwl | mask_from_negative).astype(np.int16)
+        except Exception:
+            mask_array = mask_from_descwl.astype(np.int16)
+        
+        masks_dict[band] = mask_array
+    
+    return image_tensor, positions_tensor, M, magnitude, masks_dict, star_catalog_obj, band_variances
 
 def Generate_img_catalog_batched_streaming_multiprocessing(config, n_workers=None):
     """
