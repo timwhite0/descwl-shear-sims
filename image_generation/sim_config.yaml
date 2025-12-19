@@ -1,5 +1,5 @@
 # Paths
-catsim_dir: 'scratch/regier_root/regier1/twhit/lsst_stack/descwl-shear-sims/catsim'
+catsim_dir: '/data/scratch/twhit/lsst_stack/descwl-shear-sims/catsim'
 output_dir: '/nfs/turbo/lsa-regier/scratch/descwl'
 
 # Processing
