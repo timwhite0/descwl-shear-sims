@@ -459,8 +459,8 @@ def create_batch_tensors(batch_size, n_channels, img_size, max_sources_estimate)
         'catalog': {
             'locs': torch.full((batch_size, max_sources_estimate, 2), float('nan'), dtype=torch.float32),
             'n_sources': torch.zeros(batch_size, dtype=torch.long),
-            'shear_1': torch.zeros(batch_size, max_sources_estimate, 1, dtype=torch.float32),
-            'shear_2': torch.zeros(batch_size, max_sources_estimate, 1, dtype=torch.float32),
+            'shear_1': torch.zeros(batch_size, dtype=torch.float32),
+            'shear_2': torch.zeros(batch_size, dtype=torch.float32),
         },
         'psf_params': {}
     }
@@ -470,27 +470,18 @@ def add_image_to_batch(batch, local_idx, image, positions, n_sources, g1, g2, ps
     """Add a single image and its data to the batch."""
     batch['images'][local_idx] = image
 
-    # Handle case where we need to expand catalog tensors
+    # Handle case where we need to expand locs tensor
     max_sources = batch['catalog']['locs'].shape[1]
     if n_sources > max_sources:
-        # Expand tensors
         batch_size = batch['catalog']['locs'].shape[0]
         new_locs = torch.full((batch_size, n_sources, 2), float('nan'), dtype=torch.float32)
-        new_shear_1 = torch.zeros(batch_size, n_sources, 1, dtype=torch.float32)
-        new_shear_2 = torch.zeros(batch_size, n_sources, 1, dtype=torch.float32)
-
         new_locs[:, :max_sources] = batch['catalog']['locs']
-        new_shear_1[:, :max_sources] = batch['catalog']['shear_1']
-        new_shear_2[:, :max_sources] = batch['catalog']['shear_2']
-
         batch['catalog']['locs'] = new_locs
-        batch['catalog']['shear_1'] = new_shear_1
-        batch['catalog']['shear_2'] = new_shear_2
 
     batch['catalog']['locs'][local_idx, :n_sources] = positions
     batch['catalog']['n_sources'][local_idx] = n_sources
-    batch['catalog']['shear_1'][local_idx, :n_sources, 0] = float(g1)
-    batch['catalog']['shear_2'][local_idx, :n_sources, 0] = float(g2)
+    batch['catalog']['shear_1'][local_idx] = float(g1)
+    batch['catalog']['shear_2'][local_idx] = float(g2)
 
     if psf_param is not None:
         batch['psf_params'][local_idx] = psf_param
