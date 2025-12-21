@@ -207,6 +207,13 @@ def create_psf(config, se_dim, rng_seed):
         return make_fixed_psf(psf_type=config['psf_type'], psf_fwhm=config.get('psf_fwhm', 0.8))
 
 
+def get_optional_psf_param(psf, config):
+    """Get PSF parameters if configured, otherwise return None."""
+    if config.get('save_psf_param', False):
+        return get_psf_param(psf, return_image=True, psf_size=config.get('psf_size', 64))
+    return None
+
+
 # =============================================================================
 # Star Catalog Functions
 # =============================================================================
@@ -297,7 +304,7 @@ def filter_bright_stars_production(star_catalog, mag_threshold=18, band='r', ver
 # =============================================================================
 
 def generate_single_image(
-    rng, config, psf, layout, shifts, g1, g2
+    rng, config, psf, layout, shifts, g1, g2, crop_size=None
 ):
     """
     Generate a single simulated image with catalog.
@@ -401,6 +408,13 @@ def generate_single_image(
         image_np = sim_data['band_data'][band][0].image.array
         image[i] = torch.from_numpy(image_np.copy())
 
+    # Crop image if crop_size is specified
+    if crop_size is not None:
+        h_center, w_center = image.shape[1] // 2, image.shape[2] // 2
+        half_crop = crop_size // 2
+        image = image[:, h_center - half_crop:h_center + half_crop,
+                         w_center - half_crop:w_center + half_crop]
+
     return image, positions, n_sources, magnitude
 
 
@@ -421,24 +435,15 @@ def process_single_image_worker(args):
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
     psf = create_psf(config, se_dim, config['seed'] + iter_idx)
 
-    # Generate image
+    # Generate image (cropping is done inside generate_single_image)
     image, positions, n_sources, magnitude = generate_single_image(
-        rng, config, psf, layout, shifts, g1_val, g2_val
+        rng, config, psf, layout, shifts, g1_val, g2_val,
+        crop_size=config.get('crop_size', 2048)
     )
 
-    # Crop to 2048x2048
-    crop_size = 2048
-    h_center, w_center = image.shape[1] // 2, image.shape[2] // 2
-    half_crop = crop_size // 2
-    cropped_image = image[:, h_center - half_crop:h_center + half_crop,
-                          w_center - half_crop:w_center + half_crop]
+    psf_param = get_optional_psf_param(psf, config)
 
-    # Get PSF params if configured
-    psf_param = None
-    if config.get('save_psf_param', False):
-        psf_param = get_psf_param(psf, return_image=True, psf_size=config.get('psf_size', 64))
-
-    return iter_idx, cropped_image, positions, n_sources, magnitude, psf_param
+    return iter_idx, image, positions, n_sources, magnitude, psf_param
 
 
 # =============================================================================
@@ -579,7 +584,7 @@ def generate_images(config):
         batch = create_batch_tensors(
             current_batch_size,
             len(config['bands']),
-            2048,
+            config.get('crop_size', 2048),
             max_sources_estimate
         )
 
@@ -618,22 +623,14 @@ def generate_images(config):
             # Sequential mode
             for local_idx, global_idx in enumerate(tqdm(batch_indices, desc=f"Batch {batch_num}")):
                 image, positions, n_sources, mag = generate_single_image(
-                    rng, config, psf, layout, shifts, g1[global_idx], g2[global_idx]
+                    rng, config, psf, layout, shifts, g1[global_idx], g2[global_idx],
+                    crop_size=config.get('crop_size', 2048)
                 )
 
-                # Crop to 2048x2048
-                crop_size = 2048
-                h_center, w_center = image.shape[1] // 2, image.shape[2] // 2
-                half_crop = crop_size // 2
-                cropped_image = image[:, h_center - half_crop:h_center + half_crop,
-                                      w_center - half_crop:w_center + half_crop]
-
-                psf_param = None
-                if save_psf:
-                    psf_param = get_psf_param(psf, return_image=True, psf_size=config.get('psf_size', 64))
+                psf_param = get_optional_psf_param(psf, config)
 
                 add_image_to_batch(
-                    batch, local_idx, cropped_image, positions, n_sources,
+                    batch, local_idx, image, positions, n_sources,
                     g1[global_idx], g2[global_idx], psf_param
                 )
 

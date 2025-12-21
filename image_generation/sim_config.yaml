@@ -42,6 +42,7 @@ star_setting:
 # Image settings
 pixel_scale: 0.2
 coadd_dim: 2550             # without rotation, image dim is coadd_dim + 1
+crop_size: 2048             # final image dimension after center cropping
 buff: 0
 bands: ['r', 'i', 'z']
 noise_factor: 1
