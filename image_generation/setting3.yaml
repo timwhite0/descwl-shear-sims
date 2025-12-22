@@ -1,0 +1,58 @@
+# Paths
+catsim_dir: '/data/scratch/twhit/lsst_stack/descwl-shear-sims/catsim'
+output_dir: '/nfs/turbo/lsa-regier/scratch/descwl'
+
+# Processing
+use_multiprocessing: true
+n_workers: 12
+stop_on_multiprocessing_fail: true
+batch_size: 500
+aggressive_gc: true
+
+# Data generation settings
+num_images: 14000
+setting: setting3
+seed: 3
+
+# PSF settings
+psf_type: "moffat"          # "moffat" or "gauss"
+psf_fwhm: 0.8               # FWHM in arcsec (for fixed PSF)
+variable_psf: true
+variation_factor: 1.0
+save_psf_param: false
+psf_size: 64
+
+# Galaxy settings (wldeblend catalog)
+density: 240                # per square arcmin
+select_observable: 'i_ab'   # magnitude band for selection
+select_lower_limit: null    # minimum magnitude
+select_upper_limit: 27      # maximum magnitude
+
+# Star settings
+generate_stars: true
+draw_bright: true
+star_bleeds: true
+star_config:
+  max_density: 100
+star_setting:
+  star_filter: false
+  star_filter_mag: 18.0
+  star_filter_band: 'r'
+
+# Image settings
+pixel_scale: 0.2
+coadd_dim: 2550             # without rotation, image dim is coadd_dim + 1
+crop_size: 2048             # final image dimension after center cropping
+buff: 0
+bands: ['r', 'i', 'z']
+noise_factor: 1
+
+# Image artifacts
+cosmic_rays: false
+bad_columns: false
+
+# Layout settings
+layout_name: 'random'       # 'random', 'grid', 'hex', or 'pair'
+dither: false
+dither_size: 0.5
+rotate: false

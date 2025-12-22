@@ -4,32 +4,32 @@ output_dir: '/nfs/turbo/lsa-regier/scratch/descwl'
 
 # Processing
 use_multiprocessing: true
-n_workers: 32
+n_workers: 12
 stop_on_multiprocessing_fail: true
-batch_size: 350
+batch_size: 500
 aggressive_gc: true
 
 # Data generation settings
-num_data: 14000
-setting: NPE_vary_psf_star_2-100_with_artifact_galaxy_80_irz
-seed: 0
+num_images: 14000
+setting: setting1
+seed: 1
 
 # PSF settings
 psf_type: "moffat"          # "moffat" or "gauss"
 psf_fwhm: 0.8               # FWHM in arcsec (for fixed PSF)
-variable_psf: true
+variable_psf: false
 variation_factor: 1.0
 save_psf_param: false
 psf_size: 64
 
 # Galaxy settings (wldeblend catalog)
-density: 80                 # per square arcmin
+density: 240                # per square arcmin
 select_observable: 'i_ab'   # magnitude band for selection
 select_lower_limit: null    # minimum magnitude
 select_upper_limit: 27      # maximum magnitude
 
 # Star settings
-generate_star: true
+generate_stars: false
 draw_bright: true
 star_bleeds: true
 star_config:
@@ -48,8 +48,8 @@ bands: ['r', 'i', 'z']
 noise_factor: 1
 
 # Image artifacts
-cosmic_rays: true
-bad_columns: true
+cosmic_rays: false
+bad_columns: false
 
 # Layout settings
 layout_name: 'random'       # 'random', 'grid', 'hex', or 'pair'

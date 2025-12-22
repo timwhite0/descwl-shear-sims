@@ -344,7 +344,7 @@ def generate_single_image(
 
     # Create star catalog if needed
     star_catalog = None
-    if config['generate_star']:
+    if config['generate_stars']:
         star_catalog = make_star_catalog(
             rng=rng,
             coadd_dim=config['coadd_dim'],
@@ -523,7 +523,7 @@ def generate_images(config):
     Supports both sequential and multiprocessing modes.
     Saves each batch to disk immediately after generation.
     """
-    num_data = config['num_data']
+    num_images = config['num_images']
     batch_size = config['batch_size']
     save_folder = f"{config['output_dir']}/{config['setting']}"
     aggressive_gc = config.get('aggressive_gc', True)
@@ -537,9 +537,9 @@ def generate_images(config):
 
     print(f"\n=== IMAGE GENERATION ===")
     print(f"Output folder: {save_folder}")
-    print(f"Total images: {num_data}")
+    print(f"Total images: {num_images}")
     print(f"Batch size: {batch_size}")
-    print(f"Total batches: {(num_data + batch_size - 1) // batch_size}")
+    print(f"Total batches: {(num_images + batch_size - 1) // batch_size}")
     print(f"Mode: {'Multiprocessing' if use_multiprocessing else 'Sequential'}")
     if use_multiprocessing:
         print(f"Workers: {n_workers}")
@@ -549,8 +549,8 @@ def generate_images(config):
 
     # Draw shear components independently from N(0, 0.015^2)
     rng_shear = np.random.RandomState(config['seed'] + 1000)
-    g1 = rng_shear.normal(0.0, 0.015, num_data).astype(np.float32)
-    g2 = rng_shear.normal(0.0, 0.015, num_data).astype(np.float32)
+    g1 = rng_shear.normal(0.0, 0.015, num_images).astype(np.float32)
+    g2 = rng_shear.normal(0.0, 0.015, num_images).astype(np.float32)
 
     # Create layout and get shifts
     layout = Layout(
@@ -570,10 +570,10 @@ def generate_images(config):
 
     # Process batches
     successful_batches = 0
-    total_batches = (num_data + batch_size - 1) // batch_size
+    total_batches = (num_images + batch_size - 1) // batch_size
 
-    for batch_start in range(0, num_data, batch_size):
-        batch_end = min(batch_start + batch_size, num_data)
+    for batch_start in range(0, num_images, batch_size):
+        batch_end = min(batch_start + batch_size, num_images)
         batch_num = batch_start // batch_size + 1
         current_batch_size = batch_end - batch_start
 
