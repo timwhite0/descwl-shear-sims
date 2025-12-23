@@ -3,8 +3,8 @@ Consolidated image generation script for weak lensing simulations.
 Generates synthetic astronomical images with controlled shear effects.
 
 Usage:
-    python generate_images.py
-    python generate_images.py --config path/to/config.yaml
+    python generate_batches.py
+    python generate_batches.py --config path/to/config.yaml
 
 Config is read from sim_config.yaml in the same directory by default.
 """
