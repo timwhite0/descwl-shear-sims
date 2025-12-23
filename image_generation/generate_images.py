@@ -462,7 +462,7 @@ def create_batch_tensors(batch_size, n_channels, img_size, max_sources_estimate)
     return {
         'images': torch.zeros(batch_size, n_channels, img_size, img_size, dtype=torch.float32),
         'catalog': {
-            'locs': torch.full((batch_size, max_sources_estimate, 2), float('nan'), dtype=torch.float32),
+            'locs': torch.zeros(batch_size, max_sources_estimate, 2, dtype=torch.float32),
             'n_sources': torch.zeros(batch_size, dtype=torch.long),
             'shear_1': torch.zeros(batch_size, dtype=torch.float32),
             'shear_2': torch.zeros(batch_size, dtype=torch.float32),
@@ -475,11 +475,11 @@ def add_image_to_batch(batch, local_idx, image, positions, n_sources, g1, g2, ps
     """Add a single image and its data to the batch."""
     batch['images'][local_idx] = image
 
-    # Handle case where we need to expand locs tensor
+    # Safety fallback: expand locs tensor if needed (should be rare with proper estimate)
     max_sources = batch['catalog']['locs'].shape[1]
     if n_sources > max_sources:
-        batch_size = batch['catalog']['locs'].shape[0]
-        new_locs = torch.full((batch_size, n_sources, 2), float('nan'), dtype=torch.float32)
+        print(f"n_sources ({n_sources}) > max_sources ({max_sources}), resizing locs tensor")
+        new_locs = torch.full((batch['catalog']['locs'].shape[0], n_sources, 2), float('nan'), dtype=torch.float32)
         new_locs[:, :max_sources] = batch['catalog']['locs']
         batch['catalog']['locs'] = new_locs
 
@@ -570,8 +570,14 @@ def generate_images(config):
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
     psf = create_psf(config, se_dim, config['seed']) if not use_multiprocessing else None
 
-    # Estimate max sources for tensor allocation
-    max_sources_estimate = int(config['density'] * 3)
+    # Calculate max sources based on actual galaxy count plus buffer for stars
+    n_galaxies = len(shifts)
+    if config.get('generate_stars', False):
+        # Stars typically have lower density than galaxies
+        star_buffer = n_galaxies // 2
+    else:
+        star_buffer = 0
+    max_sources_estimate = n_galaxies + star_buffer + 50
 
     # Process batches
     successful_batches = 0
