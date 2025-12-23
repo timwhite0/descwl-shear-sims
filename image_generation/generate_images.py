@@ -19,6 +19,7 @@ from datetime import datetime
 
 import torch
 import numpy as np
+from numpy.random import SeedSequence
 import galsim
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
@@ -422,18 +423,17 @@ def process_single_image_worker(args):
     """
     Worker function for multiprocessing.
     Creates its own PSF to avoid serialization issues.
+    Uses SeedSequence-spawned seeds for truly independent random streams.
     """
-    (iter_idx, config, g1_val, g2_val, rng_state, layout, shifts) = args
+    (iter_idx, config, g1_val, g2_val, child_seed, layout, shifts) = args
 
-    # Create RNG with unique state for this iteration
-    rng = np.random.RandomState()
-    rng.set_state(rng_state)
-    for _ in range(iter_idx):
-        rng.rand()
+    # Create independent RNG from spawned seed
+    rng = np.random.RandomState(child_seed)
 
-    # Create PSF in worker (avoids serialization issues)
+    # Create PSF in worker with its own seed (avoids serialization issues)
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
-    psf = create_psf(config, se_dim, config['seed'] + iter_idx)
+    psf_seed = child_seed + 1000000  # Offset to avoid correlation with main rng
+    psf = create_psf(config, se_dim, psf_seed)
 
     # Generate image (cropping is done inside generate_single_image)
     image, positions, n_sources, magnitude = generate_single_image(
@@ -552,6 +552,11 @@ def generate_images(config):
     g1 = rng_shear.normal(0.0, 0.015, num_images).astype(np.float32)
     g2 = rng_shear.normal(0.0, 0.015, num_images).astype(np.float32)
 
+    # Create independent seeds for each image using SeedSequence
+    # This ensures truly independent random streams for multiprocessing
+    ss = SeedSequence(config['seed'])
+    child_seeds = [int(s.generate_state(1)[0]) for s in ss.spawn(num_images)]
+
     # Create layout and get shifts
     layout = Layout(
         layout_name=config['layout_name'],
@@ -591,14 +596,13 @@ def generate_images(config):
         batch_indices = list(range(batch_start, batch_end))
 
         if use_multiprocessing:
-            # Multiprocessing mode
+            # Multiprocessing mode - use pre-spawned independent seeds
             args_list = []
-            rng_state = rng.get_state()
 
             for global_idx in batch_indices:
                 args_list.append((
                     global_idx, config, g1[global_idx], g2[global_idx],
-                    rng_state, layout, shifts
+                    child_seeds[global_idx], layout, shifts
                 ))
 
             with ProcessPoolExecutor(max_workers=n_workers) as executor:
@@ -620,10 +624,12 @@ def generate_images(config):
                         g1[global_idx], g2[global_idx], psf_param
                     )
         else:
-            # Sequential mode
+            # Sequential mode - use child_seeds for reproducibility
             for local_idx, global_idx in enumerate(tqdm(batch_indices, desc=f"Batch {batch_num}")):
+                # Create fresh RNG from child seed for each image
+                img_rng = np.random.RandomState(child_seeds[global_idx])
                 image, positions, n_sources, mag = generate_single_image(
-                    rng, config, psf, layout, shifts, g1[global_idx], g2[global_idx],
+                    img_rng, config, psf, layout, shifts, g1[global_idx], g2[global_idx],
                     crop_size=config.get('crop_size', 2048)
                 )
 
