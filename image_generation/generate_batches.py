@@ -432,7 +432,7 @@ def process_single_image_worker(args):
 
     # Create PSF in worker with its own seed (avoids serialization issues)
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
-    psf_seed = child_seed + 1000000  # Offset to avoid correlation with main rng
+    psf_seed = (child_seed + 1000000) % (2**32)  # Offset, constrained to valid range
     psf = create_psf(config, se_dim, psf_seed)
 
     # Generate image (cropping is done inside generate_single_image)
@@ -548,7 +548,7 @@ def generate_images(config):
     rng = np.random.RandomState(config['seed'])
 
     # Draw shear components independently from N(0, 0.015^2)
-    rng_shear = np.random.RandomState(config['seed'] + 1000)
+    rng_shear = np.random.RandomState((config['seed'] + 1000) % (2**32))
     g1 = rng_shear.normal(0.0, 0.015, num_images).astype(np.float32)
     g2 = rng_shear.normal(0.0, 0.015, num_images).astype(np.float32)
 
