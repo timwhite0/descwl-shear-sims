@@ -11,7 +11,7 @@ aggressive_gc: true
 
 # Data generation settings
 num_images: 14000
-setting: setting1
+setting: setting1_batch
 seed: 1
 
 # PSF settings
