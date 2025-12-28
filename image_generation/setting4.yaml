@@ -4,14 +4,12 @@ output_dir: '/nfs/turbo/lsa-regier/scratch/descwl'
 
 # Processing
 use_multiprocessing: true
-n_workers: 48
-stop_on_multiprocessing_fail: true
-batch_size: 500
+n_workers: 28
 aggressive_gc: true
 
 # Data generation settings
 num_images: 14000
-setting: setting4_batch
+setting: setting4
 seed: 4
 
 # PSF settings

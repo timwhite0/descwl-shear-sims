@@ -1,18 +1,16 @@
 """
-Consolidated image generation script for weak lensing simulations.
+Image generation script for weak lensing simulations.
 Generates synthetic astronomical images with controlled shear effects.
 
 Usage:
-    python generate_batches.py
-    python generate_batches.py --config path/to/config.yaml
+    python generate_images.py
+    python generate_images.py --config path/to/config.yaml
 
 Config is read from sim_config.yaml in the same directory by default.
 """
 import os
 import gc
 import time
-import tempfile
-import shutil
 import argparse
 import yaml
 from datetime import datetime
@@ -24,7 +22,6 @@ import galsim
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 import concurrent.futures
-import multiprocessing as mp
 
 from descwl_shear_sims.galaxies import WLDeblendGalaxyCatalog
 from descwl_shear_sims.stars import StarCatalog, make_star_catalog
@@ -40,63 +37,6 @@ from descwl_shear_sims.layout.layout import Layout
 def cleanup_memory():
     """Force garbage collection to free memory."""
     gc.collect()
-
-
-def safe_save_tensor(tensor, filepath, max_retries=3):
-    """
-    Save tensor to disk with retry logic and atomic write.
-
-    Uses temp file + move for atomic operation to prevent corruption.
-    """
-    print(f"Saving to {os.path.basename(filepath)}...")
-
-    if hasattr(tensor, 'detach'):
-        clean_tensor = tensor.detach().cpu().contiguous()
-    else:
-        clean_tensor = tensor
-
-    target_dir = os.path.dirname(filepath)
-    target_filename = os.path.basename(filepath)
-
-    for attempt in range(max_retries):
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix='.tmp',
-                prefix=f'{target_filename}.',
-                dir=target_dir,
-                delete=False
-            ) as temp_file:
-                temp_path = temp_file.name
-
-            torch.save(clean_tensor, temp_path, _use_new_zipfile_serialization=False)
-
-            temp_size = os.path.getsize(temp_path)
-            if temp_size < 100:
-                raise RuntimeError(f"File too small: {temp_size} bytes")
-
-            shutil.move(temp_path, filepath)
-
-            if os.path.exists(filepath) and os.path.getsize(filepath) > 100:
-                size_mb = os.path.getsize(filepath) / (1024**2)
-                print(f"  Saved successfully ({size_mb:.1f} MB)")
-                return True
-            else:
-                raise RuntimeError("Final file missing or corrupted")
-
-        except Exception as e:
-            print(f"  Attempt {attempt + 1} failed: {e}")
-
-            if 'temp_path' in locals() and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except:
-                    pass
-
-            if attempt < max_retries - 1:
-                time.sleep(1)
-
-    print(f"All save attempts failed for {filepath}")
-    return False
 
 
 # =============================================================================
@@ -219,7 +159,7 @@ def get_optional_psf_param(psf, config):
 # Star Catalog Functions
 # =============================================================================
 
-def filter_bright_stars_production(star_catalog, mag_threshold=18, band='r', verbose=True):
+def filter_bright_stars(star_catalog, mag_threshold=18, band='r', verbose=True):
     """
     Filter out bright stars for performance improvement.
 
@@ -356,7 +296,7 @@ def generate_single_image(
 
         star_setting = config.get('star_setting', {})
         if star_setting.get('star_filter', False):
-            star_catalog = filter_bright_stars_production(
+            star_catalog = filter_bright_stars(
                 star_catalog,
                 mag_threshold=star_setting.get('star_filter_mag', 18),
                 band=star_setting.get('star_filter_band', 'r'),
@@ -407,7 +347,7 @@ def generate_single_image(
     image = torch.zeros(len(bands), h, w, dtype=torch.float32)
     for i, band in enumerate(bands):
         image_np = sim_data['band_data'][band][0].image.array
-        image[i] = torch.from_numpy(image_np.copy())
+        image[i] = torch.from_numpy(image_np).contiguous()
 
     # Crop image if crop_size is specified
     if crop_size is not None:
@@ -419,97 +359,42 @@ def generate_single_image(
     return image, positions, n_sources, magnitude
 
 
-def process_single_image_worker(args):
+def process_and_save_single_image(args):
     """
-    Worker function for multiprocessing.
-    Creates its own PSF to avoid serialization issues.
-    Uses SeedSequence-spawned seeds for truly independent random streams.
+    Worker function that generates AND saves directly to individual file.
+    Eliminates batch accumulation and separate_batches.py step.
     """
-    (iter_idx, config, g1_val, g2_val, child_seed, layout, shifts) = args
+    (global_idx, config, g1_val, g2_val, child_seed, layout, shifts, save_folder) = args
 
     # Create independent RNG from spawned seed
     rng = np.random.RandomState(child_seed)
 
     # Create PSF in worker with its own seed (avoids serialization issues)
     se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
-    psf_seed = (child_seed + 1000000) % (2**32)  # Offset, constrained to valid range
+    psf_seed = (child_seed + 1000000) % (2**32)
     psf = create_psf(config, se_dim, psf_seed)
 
-    # Generate image (cropping is done inside generate_single_image)
-    image, positions, n_sources, magnitude = generate_single_image(
+    # Generate image
+    image, positions, n_sources, _ = generate_single_image(
         rng, config, psf, layout, shifts, g1_val, g2_val,
         crop_size=config.get('crop_size', 2048)
     )
 
-    psf_param = get_optional_psf_param(psf, config)
-
-    return iter_idx, image, positions, n_sources, magnitude, psf_param
-
-
-# =============================================================================
-# Batch Management Functions
-# =============================================================================
-
-def create_batch_tensors(batch_size, n_channels, img_size, max_sources_estimate):
-    """
-    Create empty tensors for a new batch.
-
-    Returns a dict containing:
-    - images: [batch_size, n_channels, img_size, img_size]
-    - catalog: dict with locs, n_sources, shear_1, shear_2
-    - psf_params: dict for optional PSF parameters
-    """
-    return {
-        'images': torch.zeros(batch_size, n_channels, img_size, img_size, dtype=torch.float32),
-        'catalog': {
-            'locs': torch.zeros(batch_size, max_sources_estimate, 2, dtype=torch.float32),
-            'n_sources': torch.zeros(batch_size, dtype=torch.long),
-            'shear_1': torch.zeros(batch_size, dtype=torch.float32),
-            'shear_2': torch.zeros(batch_size, dtype=torch.float32),
+    # Save directly to individual file (matches separate_batches.py format)
+    data = {
+        "images": image,
+        "tile_catalog": {
+            "locs": positions[:n_sources],
+            "n_sources": n_sources,
+            "shear_1": float(g1_val),
+            "shear_2": float(g2_val),
         },
-        'psf_params': {}
     }
 
+    save_path = f"{save_folder}/dataset_{global_idx}_size_1.pt"
+    torch.save([data], save_path, _use_new_zipfile_serialization=False)
 
-def add_image_to_batch(batch, local_idx, image, positions, n_sources, g1, g2, psf_param=None):
-    """Add a single image and its data to the batch."""
-    batch['images'][local_idx] = image
-
-    # Safety fallback: expand locs tensor if needed (should be rare with proper estimate)
-    max_sources = batch['catalog']['locs'].shape[1]
-    if n_sources > max_sources:
-        print(f"n_sources ({n_sources}) > max_sources ({max_sources}), resizing locs tensor")
-        new_locs = torch.full((batch['catalog']['locs'].shape[0], n_sources, 2), float('nan'), dtype=torch.float32)
-        new_locs[:, :max_sources] = batch['catalog']['locs']
-        batch['catalog']['locs'] = new_locs
-
-    batch['catalog']['locs'][local_idx, :n_sources] = positions
-    batch['catalog']['n_sources'][local_idx] = n_sources
-    batch['catalog']['shear_1'][local_idx] = float(g1)
-    batch['catalog']['shear_2'][local_idx] = float(g2)
-
-    if psf_param is not None:
-        batch['psf_params'][local_idx] = psf_param
-
-
-def save_batch(batch, batch_num, save_folder, save_psf=False):
-    """
-    Save batch tensors to disk.
-
-    Returns True if all saves succeeded.
-    """
-    image_file = f"{save_folder}/batch_{batch_num}_images.pt"
-    catalog_file = f"{save_folder}/batch_{batch_num}_catalog.pt"
-
-    image_success = safe_save_tensor(batch['images'], image_file)
-    catalog_success = safe_save_tensor(batch['catalog'], catalog_file)
-
-    psf_success = True
-    if save_psf and batch['psf_params']:
-        psf_file = f"{save_folder}/batch_{batch_num}_psf_params.pt"
-        psf_success = safe_save_tensor(batch['psf_params'], psf_file)
-
-    return image_success and catalog_success and psf_success
+    return global_idx, True
 
 
 # =============================================================================
@@ -518,18 +403,15 @@ def save_batch(batch, batch_num, save_folder, save_psf=False):
 
 def generate_images(config):
     """
-    Main function to generate images in batches.
+    Main function to generate images.
 
-    Supports both sequential and multiprocessing modes.
-    Saves each batch to disk immediately after generation.
+    Each worker generates and saves its image directly to an individual file.
+    Output format: dataset_{idx}_size_1.pt (compatible with previous workflow).
     """
     num_images = config['num_images']
-    batch_size = config['batch_size']
     save_folder = f"{config['output_dir']}/{config['setting']}"
-    aggressive_gc = config.get('aggressive_gc', True)
-    use_multiprocessing = config.get('use_multiprocessing', False)
-    n_workers = config.get('n_workers', min(mp.cpu_count(), 8))
-    save_psf = config.get('save_psf_param', False)
+    n_workers = config.get('n_workers', 28)
+    worker_timeout = config.get('worker_timeout', 300)  # 5 minutes default
 
     # Set up environment
     os.environ['CATSIM_DIR'] = config['catsim_dir']
@@ -538,11 +420,8 @@ def generate_images(config):
     print(f"\n=== IMAGE GENERATION ===")
     print(f"Output folder: {save_folder}")
     print(f"Total images: {num_images}")
-    print(f"Batch size: {batch_size}")
-    print(f"Total batches: {(num_images + batch_size - 1) // batch_size}")
-    print(f"Mode: {'Multiprocessing' if use_multiprocessing else 'Sequential'}")
-    if use_multiprocessing:
-        print(f"Workers: {n_workers}")
+    print(f"Workers: {n_workers}")
+    print(f"Worker timeout: {worker_timeout}s")
 
     # Initialize RNG and pre-generate shear values
     rng = np.random.RandomState(config['seed'])
@@ -553,7 +432,6 @@ def generate_images(config):
     g2 = rng_shear.normal(0.0, 0.015, num_images).astype(np.float32)
 
     # Create independent seeds for each image using SeedSequence
-    # This ensures truly independent random streams for multiprocessing
     ss = SeedSequence(config['seed'])
     child_seeds = [int(s.generate_state(1)[0]) for s in ss.spawn(num_images)]
 
@@ -566,108 +444,50 @@ def generate_images(config):
     )
     shifts = layout.get_shifts(rng, density=config['density'])
 
-    # Create PSF for sequential mode
-    se_dim = get_se_dim(coadd_dim=config['coadd_dim'], rotate=config['rotate'])
-    psf = create_psf(config, se_dim, config['seed']) if not use_multiprocessing else None
+    # Build args for all images
+    args_list = [
+        (idx, config, g1[idx], g2[idx], child_seeds[idx], layout, shifts, save_folder)
+        for idx in range(num_images)
+    ]
 
-    # Calculate max sources based on actual galaxy count plus buffer for stars
-    n_galaxies = len(shifts)
-    if config.get('generate_stars', False):
-        # Stars typically have lower density than galaxies
-        star_buffer = n_galaxies // 2
-    else:
-        star_buffer = 0
-    max_sources_estimate = n_galaxies + star_buffer + 50
+    # Process all images with multiprocessing
+    successful = 0
+    failed_indices = []
 
-    # Process batches
-    successful_batches = 0
-    total_batches = (num_images + batch_size - 1) // batch_size
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        future_to_idx = {
+            executor.submit(process_and_save_single_image, args): args[0]
+            for args in args_list
+        }
 
-    for batch_start in range(0, num_images, batch_size):
-        batch_end = min(batch_start + batch_size, num_images)
-        batch_num = batch_start // batch_size + 1
-        current_batch_size = batch_end - batch_start
-
-        print(f"\n=== BATCH {batch_num}/{total_batches} ===")
-        print(f"Images {batch_start} to {batch_end - 1}")
-
-        # Create batch tensors
-        batch = create_batch_tensors(
-            current_batch_size,
-            len(config['bands']),
-            config.get('crop_size', 2048),
-            max_sources_estimate
-        )
-
-        batch_indices = list(range(batch_start, batch_end))
-
-        if use_multiprocessing:
-            # Multiprocessing mode - use pre-spawned independent seeds
-            args_list = []
-
-            for global_idx in batch_indices:
-                args_list.append((
-                    global_idx, config, g1[global_idx], g2[global_idx],
-                    child_seeds[global_idx], layout, shifts
-                ))
-
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                future_to_idx = {
-                    executor.submit(process_single_image_worker, args): args[0]
-                    for args in args_list
-                }
-
-                for future in tqdm(
-                    concurrent.futures.as_completed(future_to_idx),
-                    total=len(batch_indices),
-                    desc=f"Batch {batch_num}",
-                    unit="img"
-                ):
-                    global_idx, image, positions, n_sources, mag, psf_param = future.result()
-                    local_idx = global_idx - batch_start
-                    add_image_to_batch(
-                        batch, local_idx, image, positions, n_sources,
-                        g1[global_idx], g2[global_idx], psf_param
-                    )
-        else:
-            # Sequential mode - use child_seeds for reproducibility
-            for local_idx, global_idx in enumerate(tqdm(batch_indices, desc=f"Batch {batch_num}")):
-                # Create fresh RNG from child seed for each image
-                img_rng = np.random.RandomState(child_seeds[global_idx])
-                image, positions, n_sources, mag = generate_single_image(
-                    img_rng, config, psf, layout, shifts, g1[global_idx], g2[global_idx],
-                    crop_size=config.get('crop_size', 2048)
-                )
-
-                psf_param = get_optional_psf_param(psf, config)
-
-                add_image_to_batch(
-                    batch, local_idx, image, positions, n_sources,
-                    g1[global_idx], g2[global_idx], psf_param
-                )
-
-                if aggressive_gc and local_idx % 5 == 0:
-                    cleanup_memory()
-
-        # Save batch
-        if save_batch(batch, batch_num, save_folder, save_psf):
-            successful_batches += 1
-            print(f"Batch {batch_num} saved successfully")
-        else:
-            print(f"WARNING: Batch {batch_num} save failed")
-
-        # Clean up
-        del batch
-        if aggressive_gc:
-            cleanup_memory()
+        for future in tqdm(
+            concurrent.futures.as_completed(future_to_idx),
+            total=num_images,
+            desc="Generating",
+            unit="img"
+        ):
+            global_idx = future_to_idx[future]
+            try:
+                _, success = future.result(timeout=worker_timeout)
+                if success:
+                    successful += 1
+            except concurrent.futures.TimeoutError:
+                print(f"\nWARNING: Worker timed out for image {global_idx}")
+                failed_indices.append(global_idx)
+            except Exception as e:
+                print(f"\nERROR: Worker failed for image {global_idx}: {e}")
+                failed_indices.append(global_idx)
 
     print(f"\n=== GENERATION COMPLETE ===")
-    print(f"Successfully saved: {successful_batches}/{total_batches} batches")
+    print(f"Successfully saved: {successful}/{num_images} images")
+    if failed_indices:
+        print(f"Failed indices: {failed_indices}")
     print(f"Output location: {save_folder}")
 
     return {
-        'successful_batches': successful_batches,
-        'total_batches': total_batches,
+        'successful': successful,
+        'total': num_images,
+        'failed_indices': failed_indices,
         'save_folder': save_folder
     }
 
@@ -712,7 +532,7 @@ def main():
     print(f"Config snapshot saved to: {snapshot_path}")
 
     # Run generation
-    result = generate_images(config)
+    generate_images(config)
 
     end_time = time.time()
     print(f"\n=== COMPLETED ===")
