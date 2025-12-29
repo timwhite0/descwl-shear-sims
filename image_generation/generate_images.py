@@ -241,6 +241,159 @@ def filter_bright_stars(star_catalog, mag_threshold=18, band='r', verbose=True):
 
 
 # =============================================================================
+# AnaCal Data Extraction Functions
+# =============================================================================
+
+def extract_masks_and_variances(sim_data, bands):
+    """
+    Extract per-band masks and variances from simulation data.
+
+    Parameters
+    ----------
+    sim_data : dict
+        Output from make_sim() containing band_data
+    bands : list
+        List of band names (e.g., ['r', 'i', 'z'])
+
+    Returns
+    -------
+    masks_dict : dict
+        Per-band mask arrays (int16)
+    band_variances : dict
+        Per-band variance estimates (float)
+    """
+    masks_dict = {}
+    band_variances = {}
+
+    for band in bands:
+        exposure = sim_data['band_data'][band][0]
+
+        # Extract mask following xlens-style logic
+        try:
+            descwl_planes = ["CR", "BAD"]
+            bitv = exposure.mask.getPlaneBitMask(descwl_planes)
+            mask_from_descwl = (exposure.mask.array & bitv) != 0
+        except Exception:
+            mask_from_descwl = exposure.mask.array != 0
+
+        # Add xlens-style negative pixel detection
+        try:
+            variance_safe = np.where(exposure.variance.array < 0, 0, exposure.variance.array)
+            mask_from_negative = exposure.image.array < (-6.0 * np.sqrt(variance_safe))
+            mask_array = (mask_from_descwl | mask_from_negative).astype(np.int16)
+        except Exception:
+            mask_array = mask_from_descwl.astype(np.int16)
+
+        masks_dict[band] = mask_array
+
+        # Extract variance following xlens's estimate_noise_variance logic
+        variance_array = exposure.variance.array
+        mask_array_for_variance = (
+            (variance_array < 1e9) &
+            (exposure.mask.array == 0)
+        )
+
+        if np.sum(mask_array_for_variance) < 10:
+            band_variances[band] = 0.354  # Fallback
+        else:
+            noise_variance = np.nanmean(variance_array[mask_array_for_variance])
+            if (noise_variance < 1e-10) or np.isnan(noise_variance):
+                band_variances[band] = 0.354  # Fallback
+            else:
+                band_variances[band] = float(noise_variance)
+
+    return masks_dict, band_variances
+
+
+def create_bright_star_catalog(star_catalog, mag_threshold=18.0, band='r',
+                               radius_scale=5.0, min_radius=5.0, max_radius=50.0):
+    """
+    Create a catalog of bright stars for AnaCal masking.
+
+    Parameters
+    ----------
+    star_catalog : StarCatalog
+        Star catalog from make_star_catalog()
+    mag_threshold : float
+        Stars brighter (lower mag) than this will be included
+    band : str
+        Band to use for magnitude filtering
+    radius_scale : float
+        Scale factor for masking radius
+    min_radius : float
+        Minimum masking radius in pixels
+    max_radius : float
+        Maximum masking radius in pixels
+
+    Returns
+    -------
+    np.ndarray or None
+        Structured array with 'x', 'y', 'r' fields, or None if no bright stars
+    """
+    if star_catalog is None or len(star_catalog) == 0:
+        return None
+
+    try:
+        star_data = star_catalog._star_cat
+        current_indices = star_catalog.indices
+
+        # Get magnitudes
+        mag_column = f'{band}_ab'
+        if mag_column not in star_data.dtype.names:
+            available_bands = [col.replace('_ab', '') for col in star_data.dtype.names if '_ab' in col]
+            if available_bands:
+                band = available_bands[0]
+                mag_column = f'{band}_ab'
+            else:
+                return None
+
+        magnitudes = star_data[mag_column][current_indices]
+        bright_mask = np.isfinite(magnitudes) & (magnitudes < mag_threshold)
+        n_bright = np.sum(bright_mask)
+
+        if n_bright == 0:
+            return None
+
+        # Handle different array formats
+        star_positions = star_catalog.shifts_array
+
+        if len(star_positions.shape) == 2:
+            # Regular 2D array: (n_stars, 2)
+            star_positions = star_positions[bright_mask]
+        elif len(star_positions.shape) == 1:
+            # Structured array with named fields
+            if star_positions.dtype.names is not None:
+                filtered_positions = star_positions[bright_mask]
+                if 'x' in star_positions.dtype.names and 'y' in star_positions.dtype.names:
+                    star_positions = np.column_stack([filtered_positions['x'], filtered_positions['y']])
+                elif len(star_positions.dtype.names) >= 2:
+                    field1, field2 = star_positions.dtype.names[:2]
+                    star_positions = np.column_stack([filtered_positions[field1], filtered_positions[field2]])
+                else:
+                    return None
+            else:
+                # 1D flattened array - reshape to (N, 2)
+                star_positions = star_positions.reshape(-1, 2)
+                star_positions = star_positions[bright_mask]
+        else:
+            return None
+
+        bright_mags = magnitudes[bright_mask]
+        radii = radius_scale * 10**((mag_threshold - bright_mags) / 2.5)
+        radii = np.clip(radii, min_radius, max_radius)
+
+        bright_star_catalog = np.zeros(n_bright, dtype=[('x', 'f8'), ('y', 'f8'), ('r', 'f8')])
+        bright_star_catalog['x'] = star_positions[:, 0]
+        bright_star_catalog['y'] = star_positions[:, 1]
+        bright_star_catalog['r'] = radii
+
+        return bright_star_catalog
+
+    except Exception:
+        return None
+
+
+# =============================================================================
 # Single Image Generation
 # =============================================================================
 
@@ -248,7 +401,7 @@ def generate_single_image(
     rng, config, psf, layout, shifts, g1, g2, crop_size=None
 ):
     """
-    Generate a single simulated image with catalog.
+    Generate a single simulated image with catalog and AnaCal data.
 
     Returns
     -------
@@ -260,6 +413,12 @@ def generate_single_image(
         Number of sources in the image
     magnitude : array
         Magnitudes of sources
+    masks_dict : dict
+        Per-band mask arrays (int16)
+    band_variances : dict
+        Per-band variance estimates (float)
+    star_catalog : StarCatalog or None
+        Star catalog if stars were generated
     """
     # Create galaxy catalog
     galaxy_catalog = WLDeblendGalaxyCatalog(
@@ -349,6 +508,9 @@ def generate_single_image(
         image_np = sim_data['band_data'][band][0].image.array
         image[i] = torch.from_numpy(image_np).contiguous()
 
+    # Extract masks and variances for AnaCal
+    masks_dict, band_variances = extract_masks_and_variances(sim_data, bands)
+
     # Crop image if crop_size is specified
     if crop_size is not None:
         h_center, w_center = image.shape[1] // 2, image.shape[2] // 2
@@ -356,13 +518,13 @@ def generate_single_image(
         image = image[:, h_center - half_crop:h_center + half_crop,
                          w_center - half_crop:w_center + half_crop].contiguous()
 
-    return image, positions, n_sources, magnitude
+    return image, positions, n_sources, magnitude, masks_dict, band_variances, star_catalog
 
 
 def process_and_save_single_image(args):
     """
     Worker function that generates AND saves directly to individual file.
-    Eliminates batch accumulation and separate_batches.py step.
+    Includes AnaCal data (PSF, masks, variances, bright star catalog).
     """
     (global_idx, config, g1_val, g2_val, child_seed, layout, shifts, save_folder) = args
 
@@ -374,11 +536,66 @@ def process_and_save_single_image(args):
     psf_seed = (child_seed + 1000000) % (2**32)
     psf = create_psf(config, se_dim, psf_seed)
 
-    # Generate image
-    image, positions, n_sources, _ = generate_single_image(
+    # Get crop size
+    crop_size = config.get('crop_size', 2048)
+
+    # Generate image (now returns masks, variances, and star catalog)
+    image, positions, n_sources, _, masks_dict, band_variances, star_catalog = generate_single_image(
         rng, config, psf, layout, shifts, g1_val, g2_val,
-        crop_size=config.get('crop_size', 2048)
+        crop_size=None  # Don't crop inside generate_single_image; we'll do it here
     )
+
+    # Get original image dimensions for cropping
+    h, w = image.shape[1], image.shape[2]
+    h_center, w_center = h // 2, w // 2
+    half_crop = crop_size // 2
+
+    # Crop image
+    image = image[:, h_center - half_crop:h_center + half_crop,
+                     w_center - half_crop:w_center + half_crop].contiguous()
+
+    # Crop masks to match
+    cropped_masks = {}
+    for band, mask in masks_dict.items():
+        cropped_masks[band] = mask[h_center - half_crop:h_center + half_crop,
+                                   w_center - half_crop:w_center + half_crop].copy()
+
+    # Get PSF image for AnaCal
+    psf_size = config.get('psf_size', 64)
+    pixel_scale = config.get('pixel_scale', 0.2)
+    psf_stats = get_psf_param(psf, return_image=True, psf_size=psf_size)
+    psf_image = psf_stats['psf_image'].astype(np.float64)  # AnaCal expects float64
+    psf_scale = psf_stats['psf_scale']
+
+    # Create bright star catalog if stars were generated
+    bright_star_catalog = None
+    if star_catalog is not None:
+        star_setting = config.get('star_setting', {})
+        bright_star_catalog = create_bright_star_catalog(
+            star_catalog,
+            mag_threshold=star_setting.get('star_catalog_mag', 18.0),
+            band=star_setting.get('star_catalog_band', 'r'),
+            radius_scale=star_setting.get('star_radius_scale', 5.0),
+            min_radius=star_setting.get('star_min_radius', 5.0),
+            max_radius=star_setting.get('star_max_radius', 50.0)
+        )
+
+        # Adjust bright star coordinates for cropping
+        if bright_star_catalog is not None:
+            bright_star_catalog['x'] -= (w_center - half_crop)
+            bright_star_catalog['y'] -= (h_center - half_crop)
+
+            # Filter to only stars within the cropped region
+            in_bounds = (
+                (bright_star_catalog['x'] >= 0) &
+                (bright_star_catalog['x'] < crop_size) &
+                (bright_star_catalog['y'] >= 0) &
+                (bright_star_catalog['y'] < crop_size)
+            )
+            bright_star_catalog = bright_star_catalog[in_bounds]
+
+            if len(bright_star_catalog) == 0:
+                bright_star_catalog = None
 
     # Save directly to individual file
     data = {
@@ -388,6 +605,14 @@ def process_and_save_single_image(args):
             "n_sources": n_sources,
             "shear_1": float(g1_val),
             "shear_2": float(g2_val),
+        },
+        "anacal_data": {
+            "psf_image": psf_image,
+            "psf_scale": psf_scale,
+            "masks": cropped_masks,
+            "variances": band_variances,
+            "bright_star_catalog": bright_star_catalog,
+            "pixel_scale": pixel_scale,
         },
     }
 
