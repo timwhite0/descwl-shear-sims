@@ -354,7 +354,7 @@ def generate_single_image(
         h_center, w_center = image.shape[1] // 2, image.shape[2] // 2
         half_crop = crop_size // 2
         image = image[:, h_center - half_crop:h_center + half_crop,
-                         w_center - half_crop:w_center + half_crop]
+                         w_center - half_crop:w_center + half_crop].contiguous()
 
     return image, positions, n_sources, magnitude
 
@@ -380,11 +380,11 @@ def process_and_save_single_image(args):
         crop_size=config.get('crop_size', 2048)
     )
 
-    # Save directly to individual file (matches separate_batches.py format)
+    # Save directly to individual file
     data = {
         "images": image,
         "tile_catalog": {
-            "locs": positions[:n_sources],
+            "locs": positions[:n_sources].contiguous(),
             "n_sources": n_sources,
             "shear_1": float(g1_val),
             "shear_2": float(g2_val),
@@ -392,7 +392,7 @@ def process_and_save_single_image(args):
     }
 
     save_path = f"{save_folder}/dataset_{global_idx}_size_1.pt"
-    torch.save([data], save_path, _use_new_zipfile_serialization=False)
+    torch.save([data], save_path)
 
     return global_idx, True
 
