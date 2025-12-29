@@ -15,7 +15,7 @@ seed: 2
 # PSF settings
 psf_type: "moffat"          # "moffat" or "gauss"
 psf_fwhm: 0.8               # FWHM in arcsec (for fixed PSF)
-variable_psf: false
+variable_psf: true
 variation_factor: 1.0
 save_psf_param: false
 psf_size: 64
@@ -27,7 +27,7 @@ select_lower_limit: null    # minimum magnitude
 select_upper_limit: 27      # maximum magnitude
 
 # Star settings
-generate_stars: true
+generate_stars: false
 draw_bright: true
 star_bleeds: true
 star_config:
