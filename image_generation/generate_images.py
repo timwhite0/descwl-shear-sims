@@ -725,6 +725,11 @@ def main():
     parser = argparse.ArgumentParser(description='Generate weak lensing simulation images')
     parser.add_argument('--config', type=str, default='sim_config.yaml',
                         help='Path to config file (default: sim_config.yaml)')
+    parser.add_argument('--dataset-id', type=int, default=None,
+                        help='Dataset ID (1 to num_datasets). '
+                             'Each dataset gets a unique seed and subfolder.')
+    parser.add_argument('--num-datasets', type=int, default=10,
+                        help='Total number of datasets per setting (default: 10)')
     args = parser.parse_args()
 
     start_time = time.time()
@@ -744,6 +749,20 @@ def main():
     print(f"Loading config from: {config_file}")
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Handle dataset splitting
+    if args.dataset_id is not None:
+        dataset_id = args.dataset_id
+        num_datasets = args.num_datasets
+        base_seed = config['seed']
+
+        # Derive a unique seed for this dataset (1-indexed, so use dataset_id - 1)
+        config['seed'] = int(SeedSequence(base_seed).spawn(num_datasets)[dataset_id - 1].generate_state(1)[0])
+
+        # Update setting name to include dataset ID (e.g. setting1_1)
+        config['setting'] = f"{config['setting']}_{dataset_id}"
+
+        print(f"Dataset {dataset_id}/{num_datasets}: seed={config['seed']}")
 
     # Save config snapshot
     config_dir = f"{config['output_dir']}/config_snapshots"
