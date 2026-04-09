@@ -1,10 +1,10 @@
 # Paths
-catsim_dir: '/data/scratch/twhit/lsst_stack/descwl-shear-sims/catsim'
+catsim_dir: '/gpfs/accounts/regier_root/regier1/twhit/descwl-shear-sims/catsim'
 output_dir: '/nfs/turbo/lsa-regier/scratch/descwl'
 
 # Processing
 use_multiprocessing: true
-n_workers: 6
+n_workers: 16
 aggressive_gc: true
 
 # Data generation settings

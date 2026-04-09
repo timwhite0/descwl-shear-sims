@@ -22,6 +22,7 @@ import galsim
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 import concurrent.futures
+from concurrent.futures.process import BrokenProcessPool
 
 from descwl_shear_sims.galaxies import WLDeblendGalaxyCatalog
 from descwl_shear_sims.stars import StarCatalog, make_star_catalog
@@ -700,6 +701,12 @@ def generate_images(config):
                 print(f"\nWARNING: Worker timed out for image {global_idx}")
                 failed_indices.append(global_idx)
             except Exception as e:
+                if isinstance(e, BrokenProcessPool):
+                    print(
+                        f"\nFATAL: Process pool broke at image {global_idx}. "
+                        "This usually means a worker was OOM-killed."
+                    )
+                    raise
                 print(f"\nERROR: Worker failed for image {global_idx}: {e}")
                 failed_indices.append(global_idx)
 
